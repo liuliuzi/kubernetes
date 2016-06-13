@@ -18,6 +18,11 @@
 If you are using a released version of Kubernetes, you should
 refer to the docs that go with that version.
 
+<!-- TAG RELEASE_LINK, added by the munger automatically -->
+<strong>
+The latest release of this document can be found
+[here](http://releases.k8s.io/release-1.2/docs/proposals/templates.md).
+
 Documentation for other releases can be found at
 [releases.k8s.io](http://releases.k8s.io).
 </strong>
@@ -177,7 +182,7 @@ can be instantiated multiple times within the same namespace, as long as a diffe
 instantiation.  The resulting objects will be independent from a replica/load-balancing perspective.
 
 Generation of parameter values for fields such as Secrets will be delegated to an [admission controller/initializer/finalizer](https://github.com/kubernetes/kubernetes/issues/3585) rather than being solved by the template processor.  Some discussion about a generation
-service is occuring [here](https://github.com/kubernetes/kubernetes/issues/12732)
+service is occurring [here](https://github.com/kubernetes/kubernetes/issues/12732)
 
 Labels to be assigned to all objects could also be generated in addition to, or instead of, allowing labels to be supplied in the
 Template definition.
@@ -227,7 +232,7 @@ type Parameter struct {
     // $((Name)) expression during the Template to Config transformation.
     Value string
 
-    // Optional: Indicates the parameter must have a value.  Defaults to false.
+    // Optional: Indicates the parameter must have a non-empty value either provided by the user or provided by a default.  Defaults to false.
     Required bool
 
     // Optional: Type-value of the parameter (one of string, int, bool, or base64)
@@ -309,7 +314,7 @@ pod template.
       "kind": "ReplicationController",
       "apiVersion": "v1",
       "metadata": {
-        "name": "$(DATABASE_SERVICE_NAME)",
+        "name": "$(DATABASE_SERVICE_NAME)"
       },
       "spec": {
         "replicas": "$((REPLICA_COUNT))",
@@ -365,7 +370,7 @@ pod template.
     {
       "name": "MONGODB_USER",
       "description": "Username for MongoDB user that will be used for accessing the database",
-      "value": "password"
+      "value": "username",
       "required": true
     },
     {

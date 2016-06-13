@@ -15,7 +15,7 @@
 .PHONY:	build push
 
 IMAGE = fluentd-elasticsearch
-TAG = 1.14
+TAG = 1.17
 
 build:	
 	docker build -t gcr.io/google_containers/$(IMAGE):$(TAG) .

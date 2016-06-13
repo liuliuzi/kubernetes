@@ -37,7 +37,6 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/client/cache"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/kubelet"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
@@ -192,7 +191,7 @@ func (s *KubeletExecutorServer) runKubelet(
 
 	// make a separate client for events
 	eventClientConfig.QPS = s.EventRecordQPS
-	eventClientConfig.Burst = s.EventBurst
+	eventClientConfig.Burst = int(s.EventBurst)
 	kcfg.EventClient, err = clientset.NewForConfig(eventClientConfig)
 	if err != nil {
 		return err
@@ -210,7 +209,7 @@ func (s *KubeletExecutorServer) runKubelet(
 
 	// create custom cAdvisor interface which return the resource values that Mesos reports
 	ni := <-nodeInfos
-	cAdvisorInterface, err := NewMesosCadvisor(ni.Cores, ni.Mem, s.CAdvisorPort)
+	cAdvisorInterface, err := NewMesosCadvisor(ni.Cores, ni.Mem, s.CAdvisorPort, kcfg.ContainerRuntime)
 	if err != nil {
 		return err
 	}
@@ -295,7 +294,7 @@ func (s *KubeletExecutorServer) Run(hks hyperkube.Interface, _ []string) error {
 
 	var (
 		pw = cache.NewListWatchFromClient(apiclient.CoreClient, "pods", api.NamespaceAll,
-			fields.OneTermEqualSelector(client.PodHost, s.HostnameOverride),
+			fields.OneTermEqualSelector(api.PodHostField, s.HostnameOverride),
 		)
 		reg = executor.NewRegistry(apiclient)
 	)

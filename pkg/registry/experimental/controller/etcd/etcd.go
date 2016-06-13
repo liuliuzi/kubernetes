@@ -22,12 +22,11 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
-
+	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/registry/controller"
 	"k8s.io/kubernetes/pkg/registry/controller/etcd"
 	"k8s.io/kubernetes/pkg/registry/generic"
+	"k8s.io/kubernetes/pkg/runtime"
 
 	"k8s.io/kubernetes/pkg/apis/extensions"
 
@@ -40,9 +39,9 @@ type ContainerStorage struct {
 	Scale                 *ScaleREST
 }
 
-func NewStorage(s storage.Interface, storageDecorator generic.StorageDecorator) ContainerStorage {
+func NewStorage(opts generic.RESTOptions) ContainerStorage {
 	// scale does not set status, only updates spec so we ignore the status
-	controllerREST, _ := etcd.NewREST(s, storageDecorator)
+	controllerREST, _ := etcd.NewREST(opts)
 	rcRegistry := controller.NewRegistry(controllerREST)
 
 	return ContainerStorage{
@@ -68,23 +67,18 @@ func (r *ScaleREST) Get(ctx api.Context, name string) (runtime.Object, error) {
 	if err != nil {
 		return nil, errors.NewNotFound(extensions.Resource("replicationcontrollers/scale"), name)
 	}
-	return &extensions.Scale{
-		ObjectMeta: api.ObjectMeta{
-			Name:              name,
-			Namespace:         rc.Namespace,
-			CreationTimestamp: rc.CreationTimestamp,
-		},
-		Spec: extensions.ScaleSpec{
-			Replicas: rc.Spec.Replicas,
-		},
-		Status: extensions.ScaleStatus{
-			Replicas: rc.Status.Replicas,
-			Selector: rc.Spec.Selector,
-		},
-	}, nil
+	return scaleFromRC(rc), nil
 }
 
-func (r *ScaleREST) Update(ctx api.Context, obj runtime.Object) (runtime.Object, bool, error) {
+func (r *ScaleREST) Update(ctx api.Context, name string, objInfo rest.UpdatedObjectInfo) (runtime.Object, bool, error) {
+	rc, err := (*r.registry).GetController(ctx, name)
+	if err != nil {
+		return nil, false, errors.NewNotFound(extensions.Resource("replicationcontrollers/scale"), name)
+	}
+	oldScale := scaleFromRC(rc)
+
+	obj, err := objInfo.UpdatedObject(ctx, oldScale)
+
 	if obj == nil {
 		return nil, false, errors.NewBadRequest(fmt.Sprintf("nil update passed to Scale"))
 	}
@@ -97,19 +91,23 @@ func (r *ScaleREST) Update(ctx api.Context, obj runtime.Object) (runtime.Object,
 		return nil, false, errors.NewInvalid(extensions.Kind("Scale"), scale.Name, errs)
 	}
 
-	rc, err := (*r.registry).GetController(ctx, scale.Name)
-	if err != nil {
-		return nil, false, errors.NewNotFound(extensions.Resource("replicationcontrollers/scale"), scale.Name)
-	}
 	rc.Spec.Replicas = scale.Spec.Replicas
+	rc.ResourceVersion = scale.ResourceVersion
 	rc, err = (*r.registry).UpdateController(ctx, rc)
 	if err != nil {
 		return nil, false, errors.NewConflict(extensions.Resource("replicationcontrollers/scale"), scale.Name, err)
 	}
+	return scaleFromRC(rc), false, nil
+}
+
+// scaleFromRC returns a scale subresource for a replication controller.
+func scaleFromRC(rc *api.ReplicationController) *extensions.Scale {
 	return &extensions.Scale{
 		ObjectMeta: api.ObjectMeta{
 			Name:              rc.Name,
 			Namespace:         rc.Namespace,
+			UID:               rc.UID,
+			ResourceVersion:   rc.ResourceVersion,
 			CreationTimestamp: rc.CreationTimestamp,
 		},
 		Spec: extensions.ScaleSpec{
@@ -117,9 +115,11 @@ func (r *ScaleREST) Update(ctx api.Context, obj runtime.Object) (runtime.Object,
 		},
 		Status: extensions.ScaleStatus{
 			Replicas: rc.Status.Replicas,
-			Selector: rc.Spec.Selector,
+			Selector: &unversioned.LabelSelector{
+				MatchLabels: rc.Spec.Selector,
+			},
 		},
-	}, false, nil
+	}
 }
 
 // Dummy implementation

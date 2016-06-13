@@ -19,8 +19,6 @@ package volume
 import (
 	"errors"
 	"fmt"
-	"os/exec"
-	"strings"
 
 	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/volume/util"
@@ -28,8 +26,9 @@ import (
 
 var _ MetricsProvider = &metricsDu{}
 
-// metricsDu represents a MetricsProvider that calculates the used and available
-// Volume space by executing the "du" command and gathering filesystem info for the Volume path.
+// metricsDu represents a MetricsProvider that calculates the used and
+// available Volume space by executing the "du" command and gathering
+// filesystem info for the Volume path.
 type metricsDu struct {
 	// the directory path the volume is mounted to.
 	path string
@@ -40,9 +39,9 @@ func NewMetricsDu(path string) MetricsProvider {
 	return &metricsDu{path}
 }
 
-// See MetricsProvider.GetMetrics
 // GetMetrics calculates the volume usage and device free space by executing "du"
 // and gathering filesystem info for the Volume path.
+// See MetricsProvider.GetMetrics
 func (md *metricsDu) GetMetrics() (*Metrics, error) {
 	metrics := &Metrics{}
 	if md.path == "" {
@@ -64,24 +63,18 @@ func (md *metricsDu) GetMetrics() (*Metrics, error) {
 
 // runDu executes the "du" command and writes the results to metrics.Used
 func (md *metricsDu) runDu(metrics *Metrics) error {
-	// Uses the same niceness level as cadvisor.fs does when running du
-	// Uses -B 1 to always scale to a blocksize of 1 byte
-	out, err := exec.Command("nice", "-n", "19", "du", "-s", "-B", "1", md.path).CombinedOutput()
+	used, err := util.Du(md.path)
 	if err != nil {
-		return fmt.Errorf("failed command 'du' on %s with error %v", md.path, err)
+		return err
 	}
-	used, err := resource.ParseQuantity(strings.Fields(string(out))[0])
-	if err != nil {
-		return fmt.Errorf("failed to parse 'du' output %s due to error %v", out, err)
-	}
-	used.Format = resource.BinarySI
 	metrics.Used = used
 	return nil
 }
 
-// getFsInfo writes metrics.Capacity and metrics.Available from the filesystem info
+// getFsInfo writes metrics.Capacity and metrics.Available from the filesystem
+// info
 func (md *metricsDu) getFsInfo(metrics *Metrics) error {
-	available, capacity, err := util.FsInfo(md.path)
+	available, capacity, _, err := util.FsInfo(md.path)
 	if err != nil {
 		return fmt.Errorf("Failed to get FsInfo due to error %v", err)
 	}

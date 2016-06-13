@@ -29,10 +29,17 @@ import (
 	"github.com/golang/glog"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/apis/apps"
+	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
+	"k8s.io/kubernetes/pkg/apis/policy"
+	"k8s.io/kubernetes/pkg/apis/rbac"
 	"k8s.io/kubernetes/pkg/apiserver"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
+	"k8s.io/kubernetes/pkg/client/restclient"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/controller"
 	replicationcontroller "k8s.io/kubernetes/pkg/controller/replication"
@@ -42,9 +49,10 @@ import (
 	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
 	"k8s.io/kubernetes/pkg/master"
 	"k8s.io/kubernetes/pkg/runtime"
-	etcdstorage "k8s.io/kubernetes/pkg/storage/etcd"
-	"k8s.io/kubernetes/pkg/storage/etcd/etcdtest"
+	"k8s.io/kubernetes/pkg/storage/storagebackend"
 	"k8s.io/kubernetes/plugin/pkg/admission/admit"
+
+	"github.com/pborman/uuid"
 )
 
 const (
@@ -102,10 +110,10 @@ func NewMasterComponents(c *Config) *MasterComponents {
 		DeleteAllEtcdKeys()
 	}
 	// TODO: caesarxuchao: remove this client when the refactoring of client libraray is done.
-	restClient := client.NewOrDie(&client.Config{Host: s.URL, ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}, QPS: c.QPS, Burst: c.Burst})
-	clientset := clientset.NewForConfigOrDie(&client.Config{Host: s.URL, ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}, QPS: c.QPS, Burst: c.Burst})
+	restClient := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}, QPS: c.QPS, Burst: c.Burst})
+	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}, QPS: c.QPS, Burst: c.Burst})
 	rcStopCh := make(chan struct{})
-	controllerManager := replicationcontroller.NewReplicationManager(clientset, controller.NoResyncPeriodFunc, c.Burst)
+	controllerManager := replicationcontroller.NewReplicationManagerFromClient(clientset, controller.NoResyncPeriodFunc, c.Burst, 4096)
 
 	// TODO: Support events once we can cleanly shutdown an event recorder.
 	controllerManager.SetEventRecorder(&record.FakeRecorder{})
@@ -145,27 +153,56 @@ func startMasterOrDie(masterConfig *master.Config) (*master.Master, *httptest.Se
 
 // Returns a basic master config.
 func NewMasterConfig() *master.Config {
-	etcdClient := NewEtcdClient()
-	storageVersions := make(map[string]string)
+	config := storagebackend.Config{
+		ServerList: []string{"http://127.0.0.1:4001"},
+		// TODO: this is a quick hack to work around #27179. It
+		// conveniently exercises the prefix code, so maybe it's worth
+		// leaving in.
+		Prefix: uuid.New(),
+	}
 
-	etcdStorage := etcdstorage.NewEtcdStorage(etcdClient, testapi.Default.Codec(), etcdtest.PathPrefix(), false)
-	storageVersions[api.GroupName] = testapi.Default.GroupVersion().String()
-	expEtcdStorage := NewExtensionsEtcdStorage(etcdClient)
-	storageVersions[extensions.GroupName] = testapi.Extensions.GroupVersion().String()
+	negotiatedSerializer := NewSingleContentTypeSerializer(api.Scheme, testapi.Default.Codec(), runtime.ContentTypeJSON)
 
-	storageDestinations := genericapiserver.NewStorageDestinations()
-	storageDestinations.AddAPIGroup(api.GroupName, etcdStorage)
-	storageDestinations.AddAPIGroup(extensions.GroupName, expEtcdStorage)
+	storageFactory := genericapiserver.NewDefaultStorageFactory(config, runtime.ContentTypeJSON, negotiatedSerializer, genericapiserver.NewDefaultResourceEncodingConfig(), master.DefaultAPIResourceConfigSource())
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: api.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Default.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: autoscaling.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Autoscaling.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: batch.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Batch.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: apps.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Apps.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: extensions.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Extensions.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: policy.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Policy.Codec(), runtime.ContentTypeJSON))
+	storageFactory.SetSerializer(
+		unversioned.GroupResource{Group: rbac.GroupName, Resource: genericapiserver.AllResources},
+		"",
+		NewSingleContentTypeSerializer(api.Scheme, testapi.Rbac.Codec(), runtime.ContentTypeJSON))
 
 	return &master.Config{
 		Config: &genericapiserver.Config{
-			StorageDestinations: storageDestinations,
-			StorageVersions:     storageVersions,
-			APIPrefix:           "/api",
-			APIGroupPrefix:      "/apis",
-			Authorizer:          apiserver.NewAlwaysAllowAuthorizer(),
-			AdmissionControl:    admit.NewAlwaysAdmit(),
-			Serializer:          api.Codecs,
+			StorageFactory:          storageFactory,
+			APIResourceConfigSource: master.DefaultAPIResourceConfigSource(),
+			APIPrefix:               "/api",
+			APIGroupPrefix:          "/apis",
+			Authorizer:              apiserver.NewAlwaysAllowAuthorizer(),
+			AdmissionControl:        admit.NewAlwaysAdmit(),
+			Serializer:              api.Codecs,
+			EnableWatchCache:        true,
 		},
 		KubeletClient: kubeletclient.FakeKubeletClient{},
 	}
@@ -177,6 +214,7 @@ func NewIntegrationTestMasterConfig() *master.Config {
 	masterConfig.EnableCoreControllers = true
 	masterConfig.EnableIndex = true
 	masterConfig.PublicAddress = net.ParseIP("192.168.10.4")
+	masterConfig.APIResourceConfigSource = master.DefaultAPIResourceConfigSource()
 	return masterConfig
 }
 
@@ -192,8 +230,7 @@ func (m *MasterComponents) Stop(apiServer, rcManager bool) {
 		m.once.Do(m.stopRCManager)
 	}
 	if apiServer {
-		// TODO: Uncomment when fix #19254
-		// m.ApiServer.Close()
+		m.ApiServer.Close()
 	}
 }
 
@@ -224,7 +261,7 @@ func StopRC(rc *api.ReplicationController, restClient *client.Client) error {
 }
 
 // ScaleRC scales the given rc to the given replicas.
-func ScaleRC(name, ns string, replicas int, restClient *client.Client) (*api.ReplicationController, error) {
+func ScaleRC(name, ns string, replicas int32, restClient *client.Client) (*api.ReplicationController, error) {
 	scaler, err := kubectl.ScalerFor(api.Kind("ReplicationController"), restClient)
 	if err != nil {
 		return nil, err
@@ -263,7 +300,7 @@ func StartPods(numPods int, host string, restClient *client.Client) error {
 	defer func() {
 		glog.Infof("StartPods took %v with numPods %d", time.Since(start), numPods)
 	}()
-	hostField := fields.OneTermEqualSelector(client.PodHost, host)
+	hostField := fields.OneTermEqualSelector(api.PodHostField, host)
 	options := api.ListOptions{FieldSelector: hostField}
 	pods, err := restClient.Pods(TestNS).List(options)
 	if err != nil || len(pods.Items) == numPods {
@@ -274,7 +311,7 @@ func StartPods(numPods int, host string, restClient *client.Client) error {
 	controller := RCFromManifest(TestRCManifest)
 
 	// Make the rc unique to the given host.
-	controller.Spec.Replicas = numPods
+	controller.Spec.Replicas = int32(numPods)
 	controller.Spec.Template.Spec.NodeName = host
 	controller.Name = controller.Name + host
 	controller.Spec.Selector["host"] = host

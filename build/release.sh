@@ -15,8 +15,9 @@
 # limitations under the License.
 
 # Build a Kubernetes release.  This will build the binaries, create the Docker
-# images and other build artifacts.  All intermediate artifacts will be hosted
-# publicly on Google Cloud Storage currently.
+# images and other build artifacts.
+# For pushing these artifacts publicly on Google Cloud Storage, see the 
+# associated build/push-* scripts.
 
 set -o errexit
 set -o nounset
@@ -36,6 +37,14 @@ if [[ $KUBE_RELEASE_RUN_TESTS =~ ^[yY]$ ]]; then
   kube::build::run_build_command hack/test-integration.sh
 fi
 
+if [[ "${FEDERATION:-}" == "true" ]];then
+    (
+	source "${KUBE_ROOT}/build/util.sh"
+	# Write federated docker image tag to workspace
+	kube::release::semantic_image_tag_version > "${KUBE_ROOT}/federation/manifests/federated-image.tag"
+    )
+fi
+
 kube::build::copy_output
 kube::release::package_tarballs
-kube::release::gcs::release
+kube::release::package_hyperkube

@@ -28,8 +28,8 @@ import (
 	"k8s.io/kubernetes/pkg/admission"
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
+	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/client/cache"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/fields"
 	kubelet "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/runtime"
@@ -102,7 +102,7 @@ func NewServiceAccount(cl clientset.Interface) *serviceAccount {
 		0,
 	)
 
-	tokenSelector := fields.SelectorFromSet(map[string]string{client.SecretType: string(api.SecretTypeServiceAccountToken)})
+	tokenSelector := fields.SelectorFromSet(map[string]string{api.SecretTypeField: string(api.SecretTypeServiceAccountToken)})
 	secretsIndexer, secretsReflector := cache.NewNamespaceKeyedIndexerAndReflector(
 		&cache.ListWatch{
 			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
@@ -150,7 +150,7 @@ func (s *serviceAccount) Stop() {
 }
 
 func (s *serviceAccount) Admit(a admission.Attributes) (err error) {
-	if a.GetResource() != api.Resource("pods") {
+	if a.GetResource().GroupResource() != api.Resource("pods") {
 		return nil
 	}
 	obj := a.GetObject()
@@ -200,6 +200,9 @@ func (s *serviceAccount) Admit(a admission.Attributes) (err error) {
 
 	if s.MountServiceAccountToken {
 		if err := s.mountServiceAccountToken(serviceAccount, pod); err != nil {
+			if _, ok := err.(errors.APIStatus); ok {
+				return err
+			}
 			return admission.NewForbidden(a, err)
 		}
 	}
@@ -325,6 +328,26 @@ func (s *serviceAccount) limitSecretReferences(serviceAccount *api.ServiceAccoun
 		}
 	}
 
+	for _, container := range pod.Spec.InitContainers {
+		for _, env := range container.Env {
+			if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+				if !mountableSecrets.Has(env.ValueFrom.SecretKeyRef.Name) {
+					return fmt.Errorf("Init container %s with envVar %s referencing secret.secretName=\"%s\" is not allowed because service account %s does not reference that secret", container.Name, env.Name, env.ValueFrom.SecretKeyRef.Name, serviceAccount.Name)
+				}
+			}
+		}
+	}
+
+	for _, container := range pod.Spec.Containers {
+		for _, env := range container.Env {
+			if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+				if !mountableSecrets.Has(env.ValueFrom.SecretKeyRef.Name) {
+					return fmt.Errorf("Container %s with envVar %s referencing secret.secretName=\"%s\" is not allowed because service account %s does not reference that secret", container.Name, env.Name, env.ValueFrom.SecretKeyRef.Name, serviceAccount.Name)
+				}
+			}
+		}
+	}
+
 	// limit pull secret references as well
 	pullSecrets := sets.NewString()
 	for _, s := range serviceAccount.ImagePullSecrets {
@@ -348,8 +371,9 @@ func (s *serviceAccount) mountServiceAccountToken(serviceAccount *api.ServiceAcc
 		// We don't have an API token to mount, so return
 		if s.RequireAPIToken {
 			// If a token is required, this is considered an error
-			// TODO: convert to a ServerTimeout error (or other error that sends a Retry-After header)
-			return fmt.Errorf("no API token found for service account %s/%s, retry after the token is automatically created and added to the service account", serviceAccount.Namespace, serviceAccount.Name)
+			err := errors.NewServerTimeout(unversioned.GroupResource{Resource: "serviceaccounts"}, "create pod", 1)
+			err.ErrStatus.Message = fmt.Sprintf("No API token found for service account %q, retry after the token is automatically created and added to the service account", serviceAccount.Name)
+			return err
 		}
 		return nil
 	}
@@ -385,6 +409,20 @@ func (s *serviceAccount) mountServiceAccountToken(serviceAccount *api.ServiceAcc
 
 	// Ensure every container mounts the APISecret volume
 	needsTokenVolume := false
+	for i, container := range pod.Spec.InitContainers {
+		existingContainerMount := false
+		for _, volumeMount := range container.VolumeMounts {
+			// Existing mounts at the default mount path prevent mounting of the API token
+			if volumeMount.MountPath == DefaultAPITokenMountPath {
+				existingContainerMount = true
+				break
+			}
+		}
+		if !existingContainerMount {
+			pod.Spec.InitContainers[i].VolumeMounts = append(pod.Spec.InitContainers[i].VolumeMounts, volumeMount)
+			needsTokenVolume = true
+		}
+	}
 	for i, container := range pod.Spec.Containers {
 		existingContainerMount := false
 		for _, volumeMount := range container.VolumeMounts {

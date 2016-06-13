@@ -21,13 +21,14 @@ import (
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/resource"
+	"k8s.io/kubernetes/test/e2e/framework"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("LimitRange", func() {
-	f := NewFramework("limitrange")
+var _ = framework.KubeDescribe("LimitRange", func() {
+	f := framework.NewDefaultFramework("limitrange")
 
 	It("should create a LimitRange with defaults and ensure pod has those defaults applied.", func() {
 		By("Creating a LimitRange")
@@ -52,7 +53,7 @@ var _ = Describe("LimitRange", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("Creating a Pod with no resource requirements")
-		pod := newTestPod("pod-no-resources", api.ResourceList{}, api.ResourceList{})
+		pod := newTestPod(f, "pod-no-resources", api.ResourceList{}, api.ResourceList{})
 		pod, err = f.Client.Pods(f.Namespace.Name).Create(pod)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -61,11 +62,15 @@ var _ = Describe("LimitRange", func() {
 		Expect(err).NotTo(HaveOccurred())
 		for i := range pod.Spec.Containers {
 			err = equalResourceRequirement(expected, pod.Spec.Containers[i].Resources)
-			Expect(err).NotTo(HaveOccurred())
+			if err != nil {
+				// Print the pod to help in debugging.
+				framework.Logf("Pod %+v does not have the expected requirements", pod)
+				Expect(err).NotTo(HaveOccurred())
+			}
 		}
 
 		By("Creating a Pod with partial resource requirements")
-		pod = newTestPod("pod-partial-resources", getResourceList("", "150Mi"), getResourceList("300m", ""))
+		pod = newTestPod(f, "pod-partial-resources", getResourceList("", "150Mi"), getResourceList("300m", ""))
 		pod, err = f.Client.Pods(f.Namespace.Name).Create(pod)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -78,16 +83,20 @@ var _ = Describe("LimitRange", func() {
 		expected = api.ResourceRequirements{Requests: getResourceList("300m", "150Mi"), Limits: getResourceList("300m", "500Mi")}
 		for i := range pod.Spec.Containers {
 			err = equalResourceRequirement(expected, pod.Spec.Containers[i].Resources)
-			Expect(err).NotTo(HaveOccurred())
+			if err != nil {
+				// Print the pod to help in debugging.
+				framework.Logf("Pod %+v does not have the expected requirements", pod)
+				Expect(err).NotTo(HaveOccurred())
+			}
 		}
 
 		By("Failing to create a Pod with less than min resources")
-		pod = newTestPod(podName, getResourceList("10m", "50Mi"), api.ResourceList{})
+		pod = newTestPod(f, podName, getResourceList("10m", "50Mi"), api.ResourceList{})
 		pod, err = f.Client.Pods(f.Namespace.Name).Create(pod)
 		Expect(err).To(HaveOccurred())
 
 		By("Failing to create a Pod with more than max resources")
-		pod = newTestPod(podName, getResourceList("600m", "600Mi"), api.ResourceList{})
+		pod = newTestPod(f, podName, getResourceList("600m", "600Mi"), api.ResourceList{})
 		pod, err = f.Client.Pods(f.Namespace.Name).Create(pod)
 		Expect(err).To(HaveOccurred())
 	})
@@ -95,12 +104,12 @@ var _ = Describe("LimitRange", func() {
 })
 
 func equalResourceRequirement(expected api.ResourceRequirements, actual api.ResourceRequirements) error {
-	Logf("Verifying requests: expected %s with actual %s", expected.Requests, actual.Requests)
+	framework.Logf("Verifying requests: expected %v with actual %v", expected.Requests, actual.Requests)
 	err := equalResourceList(expected.Requests, actual.Requests)
 	if err != nil {
 		return err
 	}
-	Logf("Verifying limits: expected %v with actual %v", expected.Limits, actual.Limits)
+	framework.Logf("Verifying limits: expected %v with actual %v", expected.Limits, actual.Limits)
 	err = equalResourceList(expected.Limits, actual.Limits)
 	if err != nil {
 		return err
@@ -158,7 +167,7 @@ func newLimitRange(name string, limitType api.LimitType,
 }
 
 // newTestPod returns a pod that has the specified requests and limits
-func newTestPod(name string, requests api.ResourceList, limits api.ResourceList) *api.Pod {
+func newTestPod(f *framework.Framework, name string, requests api.ResourceList, limits api.ResourceList) *api.Pod {
 	return &api.Pod{
 		ObjectMeta: api.ObjectMeta{
 			Name: name,
@@ -166,8 +175,8 @@ func newTestPod(name string, requests api.ResourceList, limits api.ResourceList)
 		Spec: api.PodSpec{
 			Containers: []api.Container{
 				{
-					Name:  "nginx",
-					Image: "gcr.io/google_containers/pause:2.0",
+					Name:  "pause",
+					Image: framework.GetPauseImageName(f.Client),
 					Resources: api.ResourceRequirements{
 						Requests: requests,
 						Limits:   limits,

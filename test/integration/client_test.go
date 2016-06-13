@@ -29,22 +29,23 @@ import (
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
+	"k8s.io/kubernetes/pkg/client/restclient"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/version"
 	"k8s.io/kubernetes/pkg/watch"
+	e2e "k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 func TestClient(t *testing.T) {
 	_, s := framework.RunAMaster(t)
-	// TODO: Uncomment when fix #19254
-	// defer s.Close()
+	defer s.Close()
 
 	ns := api.NamespaceDefault
 	framework.DeleteAllEtcdKeys()
-	client := client.NewOrDie(&client.Config{Host: s.URL, ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
 
 	info, err := client.Discovery().ServerVersion()
 	if err != nil {
@@ -110,12 +111,11 @@ func TestClient(t *testing.T) {
 
 func TestSingleWatch(t *testing.T) {
 	_, s := framework.RunAMaster(t)
-	// TODO: Uncomment when fix #19254
-	// defer s.Close()
+	defer s.Close()
 
 	ns := "blargh"
 	deleteAllEtcdKeys()
-	client := client.NewOrDie(&client.Config{Host: s.URL, ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
 
 	mkEvent := func(i int) *api.Event {
 		name := fmt.Sprintf("event-%v", i)
@@ -196,11 +196,10 @@ func TestMultiWatch(t *testing.T) {
 	framework.DeleteAllEtcdKeys()
 	defer framework.DeleteAllEtcdKeys()
 	_, s := framework.RunAMaster(t)
-	// TODO: Uncomment when fix #19254
-	// defer s.Close()
+	defer s.Close()
 
 	ns := api.NamespaceDefault
-	client := client.NewOrDie(&client.Config{Host: s.URL, ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
 
 	dummyEvent := func(i int) *api.Event {
 		name := fmt.Sprintf("unrelated-%v", i)
@@ -236,8 +235,8 @@ func TestMultiWatch(t *testing.T) {
 			},
 			Spec: api.PodSpec{
 				Containers: []api.Container{{
-					Name:  "nothing",
-					Image: "kubernetes/pause",
+					Name:  "pause",
+					Image: e2e.GetPauseImageName(client),
 				}},
 			},
 		})
@@ -343,7 +342,7 @@ func TestMultiWatch(t *testing.T) {
 						Spec: api.PodSpec{
 							Containers: []api.Container{{
 								Name:  "nothing",
-								Image: "kubernetes/pause",
+								Image: e2e.GetPauseImageName(client),
 							}},
 						},
 					})
@@ -374,7 +373,7 @@ func TestMultiWatch(t *testing.T) {
 			if err != nil {
 				panic(fmt.Sprintf("Couldn't get %v: %v", name, err))
 			}
-			pod.Spec.Containers[0].Image = "kubernetes/pause:1"
+			pod.Spec.Containers[0].Image = e2e.GetPauseImageName(client)
 			sentTimes <- timePair{time.Now(), name}
 			if _, err := client.Pods(ns).Update(pod); err != nil {
 				panic(fmt.Sprintf("Couldn't make %v: %v", name, err))

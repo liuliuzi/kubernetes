@@ -236,7 +236,7 @@ function kube-check {
   let effective_timeout=($timeout/$sleepstep)
   attempt=0
   echo
-  printf "This may take several minutes. Bound to $effective_timeout attemmps"
+  printf "This may take several minutes. Bound to $effective_timeout attempts"
   while true; do
     local rc=0
     output=$(kube-ssh ${nodeip} "${cmd}") || rc=1
@@ -262,9 +262,6 @@ function kube-check {
   done
 }
 
-
-
-
 #
 # verify if salt master is up. check 30 times and then echo out bad output and return 0
 #
@@ -277,7 +274,7 @@ function remote-pgrep {
 
   max_attempt=60
 
-  printf "This may take several minutes. Bound to $max_attempt attemmps"
+  printf "This may take several minutes. Bound to $max_attempt attempts"
 
   attempt=0
   while true; do
@@ -306,6 +303,43 @@ function remote-pgrep {
   done
 }
 
+# identify the pod routes and route them together.
+#
+# Assumptions:
+#  All packages have been installed and kubelet has started running.
+#
+function setup-pod-routes {
+  # wait till the kubelet sets up the bridge.
+  echo "Setting up routes"
+  for (( i=0; i<${#NODE_NAMES[@]}; i++)); do
+     printf "check if cbr0 bridge is ready on ${NODE_NAMES[$i]}\n"
+     kube-check ${KUBE_NODE_IP_ADDRESSES[$i]} 'sudo ifconfig cbr0 | grep -oP "inet addr:\K\S+"'
+  done
+
+
+  # identify the subnet assigned to the node by the kubernertes controller manager.
+  KUBE_NODE_BRIDGE_NETWORK=()
+  for (( i=0; i<${#NODE_NAMES[@]}; i++)); do
+     printf " finding network of cbr0 bridge on node  ${NODE_NAMES[$i]}\n"
+     network=$(kube-ssh ${KUBE_NODE_IP_ADDRESSES[$i]} 'sudo ip route show | grep -E "dev cbr0" | cut -d     " " -f1')
+     KUBE_NODE_BRIDGE_NETWORK+=("${network}")
+  done
+
+
+  # Make the pods visible to each other and to the master.
+  # The master needs have routes to the pods for the UI to work.
+  local j
+  for (( i=0; i<${#NODE_NAMES[@]}; i++)); do
+     printf "setting up routes for ${NODE_NAMES[$i]}"
+     kube-ssh "${KUBE_MASTER_IP}" "sudo route add -net ${KUBE_NODE_BRIDGE_NETWORK[${i}]} gw ${KUBE_NODE_IP_ADDRESSES[${i}]}"
+     for (( j=0; j<${#NODE_NAMES[@]}; j++)); do
+        if [[ $i != $j ]]; then
+           kube-ssh ${KUBE_NODE_IP_ADDRESSES[$i]} "sudo route add -net ${KUBE_NODE_BRIDGE_NETWORK[$j]} gw ${KUBE_NODE_IP_ADDRESSES[$j]}"
+        fi
+      done
+  done
+}
+
 # Instantiate a kubernetes cluster
 #
 # Assumed vars:
@@ -323,6 +357,18 @@ function kube-up {
   local htpasswd
   htpasswd=$(cat "${KUBE_TEMP}/htpasswd")
 
+  # This calculation of the service IP should work, but if you choose an
+  # alternate subnet, there's a small chance you'd need to modify the
+  # service_ip, below.  We'll choose an IP like 10.244.240.1 by taking
+  # the first three octets of the SERVICE_CLUSTER_IP_RANGE and tacking
+  # on a .1
+  local octets
+  local service_ip
+  octets=($(echo "${SERVICE_CLUSTER_IP_RANGE}" | sed -e 's|/.*||' -e 's/\./ /g'))
+  ((octets[3]+=1))
+  service_ip=$(echo "${octets[*]}" | sed 's/ /./g')
+  MASTER_EXTRA_SANS="IP:${service_ip},DNS:${MASTER_NAME},${MASTER_EXTRA_SANS}"
+
   echo "Starting master VM (this can take a minute)..."
 
   (
@@ -331,12 +377,15 @@ function kube-up {
     grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/hostname.sh"
     echo "cd /home/kube/cache/kubernetes-install"
     echo "readonly MASTER_NAME='${MASTER_NAME}'"
+    echo "readonly MASTER_IP_RANGE='${MASTER_IP_RANGE}'"
     echo "readonly INSTANCE_PREFIX='${INSTANCE_PREFIX}'"
     echo "readonly NODE_INSTANCE_PREFIX='${INSTANCE_PREFIX}-node'"
+    echo "readonly NODE_IP_RANGES='${NODE_IP_RANGES}'"
     echo "readonly SERVICE_CLUSTER_IP_RANGE='${SERVICE_CLUSTER_IP_RANGE}'"
     echo "readonly ENABLE_NODE_LOGGING='${ENABLE_NODE_LOGGING:-false}'"
     echo "readonly LOGGING_DESTINATION='${LOGGING_DESTINATION:-}'"
     echo "readonly ENABLE_CLUSTER_DNS='${ENABLE_CLUSTER_DNS:-false}'"
+    echo "readonly ENABLE_CLUSTER_UI='${ENABLE_CLUSTER_UI:-false}'"
     echo "readonly DNS_SERVER_IP='${DNS_SERVER_IP:-}'"
     echo "readonly DNS_DOMAIN='${DNS_DOMAIN:-}'"
     echo "readonly KUBE_USER='${KUBE_USER:-}'"
@@ -345,6 +394,7 @@ function kube-up {
     echo "readonly SALT_TAR='${SALT_TAR##*/}'"
     echo "readonly MASTER_HTPASSWD='${htpasswd}'"
     echo "readonly E2E_STORAGE_TEST_ENVIRONMENT='${E2E_STORAGE_TEST_ENVIRONMENT:-}'"
+    echo "readonly MASTER_EXTRA_SANS='${MASTER_EXTRA_SANS:-}'"
     grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/create-dynamic-salt-files.sh"
     grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/install-release.sh"
     grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/salt-master.sh"
@@ -365,7 +415,7 @@ function kube-up {
       grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/hostname.sh"
       echo "KUBE_MASTER=${KUBE_MASTER}"
       echo "KUBE_MASTER_IP=${KUBE_MASTER_IP}"
-      echo "NODE_IP_RANGE=${NODE_IP_RANGES[$i]}"
+      echo "NODE_IP_RANGE=$NODE_IP_RANGES"
       grep -v "^#" "${KUBE_ROOT}/cluster/vsphere/templates/salt-minion.sh"
     ) > "${KUBE_TEMP}/node-start-${i}.sh"
 
@@ -427,8 +477,10 @@ function kube-up {
     done
     printf " OK\n"
   done
-  echo "Kubernetes cluster created."
 
+  setup-pod-routes
+
+  echo "Kubernetes cluster created."
   # TODO use token instead of basic auth
   export KUBE_CERT="/tmp/$RANDOM-kubecfg.crt"
   export KUBE_KEY="/tmp/$RANDOM-kubecfg.key"
@@ -444,6 +496,7 @@ function kube-up {
 
     create-kubeconfig
   )
+  printf "\n"
 
   echo
   echo "Sanity checking cluster..."
@@ -451,7 +504,6 @@ function kube-up {
   sleep 5
 
   # Basic sanity checking
-  local i
   for (( i=0; i<${#NODE_NAMES[@]}; i++)); do
       # Make sure docker is installed
       kube-ssh "${KUBE_NODE_IP_ADDRESSES[$i]}" which docker > /dev/null || {

@@ -50,7 +50,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/client/cache"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/client/restclient"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/watch"
@@ -89,6 +89,7 @@ func NewTestServer(t *testing.T, namespace string, mockPodListWatch *MockPodsLis
 	mux := http.NewServeMux()
 
 	podListHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		pods := mockPodListWatch.Pods()
 		w.Write([]byte(runtime.EncodeOrDie(testapi.Default.Codec(), &pods)))
@@ -106,6 +107,7 @@ func NewTestServer(t *testing.T, namespace string, mockPodListWatch *MockPodsLis
 		ts.stats[name] = ts.stats[name] + 1
 
 		p := mockPodListWatch.Pod(name)
+		w.Header().Set("Content-Type", "application/json")
 		if p != nil {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(runtime.EncodeOrDie(testapi.Default.Codec(), p)))
@@ -117,6 +119,7 @@ func NewTestServer(t *testing.T, namespace string, mockPodListWatch *MockPodsLis
 	mux.HandleFunc(
 		testapi.Default.ResourcePath("events", namespace, ""),
 		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 		},
 	)
@@ -125,6 +128,7 @@ func NewTestServer(t *testing.T, namespace string, mockPodListWatch *MockPodsLis
 		testapi.Default.ResourcePath("nodes", "", ""),
 		func(w http.ResponseWriter, r *http.Request) {
 			var node api.Node
+			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
@@ -144,6 +148,7 @@ func NewTestServer(t *testing.T, namespace string, mockPodListWatch *MockPodsLis
 
 	mux.HandleFunc("/", func(res http.ResponseWriter, req *http.Request) {
 		t.Errorf("unexpected request: %v", req.RequestURI)
+		res.Header().Set("Content-Type", "application/json")
 		res.WriteHeader(http.StatusNotFound)
 	})
 
@@ -293,7 +298,7 @@ func NewTestPod() (*api.Pod, int) {
 				{
 					Ports: []api.ContainerPort{
 						{
-							ContainerPort: 8000 + currentPodNum,
+							ContainerPort: int32(8000 + currentPodNum),
 							Protocol:      api.ProtocolTCP,
 						},
 					},
@@ -490,9 +495,9 @@ func newLifecycleTest(t *testing.T) lifecycleTest {
 	ei.Data = []byte{0, 1, 2}
 
 	// create framework
-	client := clientset.NewForConfigOrDie(&client.Config{
+	client := clientset.NewForConfigOrDie(&restclient.Config{
 		Host:          apiServer.server.URL,
-		ContentConfig: client.ContentConfig{GroupVersion: testapi.Default.GroupVersion()},
+		ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()},
 	})
 	c := *schedcfg.CreateDefaultConfig()
 	fw := framework.New(framework.Config{
@@ -623,8 +628,7 @@ func (lt lifecycleTest) Start() <-chan LaunchedTask {
 }
 
 func (lt lifecycleTest) Close() {
-	// TODO: Uncomment when fix #19254
-	// lt.apiServer.server.Close()
+	lt.apiServer.server.Close()
 }
 
 func (lt lifecycleTest) End() <-chan struct{} {

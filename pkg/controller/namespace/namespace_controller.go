@@ -23,9 +23,11 @@ import (
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/client/cache"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/pkg/client/typed/dynamic"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/framework"
 	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/kubernetes/pkg/util/metrics"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/util/workqueue"
@@ -38,23 +40,41 @@ import (
 type NamespaceController struct {
 	// client that purges namespace content, must have list/delete privileges on all content
 	kubeClient clientset.Interface
+	// clientPool manages a pool of dynamic clients
+	clientPool dynamic.ClientPool
 	// store that holds the namespaces
 	store cache.Store
 	// controller that observes the namespaces
 	controller *framework.Controller
 	// namespaces that have been queued up for processing by workers
-	queue *workqueue.Type
-	// list of versions to process
-	versions *unversioned.APIVersions
+	queue workqueue.RateLimitingInterface
+	// list of preferred group versions and their corresponding resource set for namespace deletion
+	groupVersionResources []unversioned.GroupVersionResource
+	// opCache is a cache to remember if a particular operation is not supported to aid dynamic client.
+	opCache operationNotSupportedCache
+	// finalizerToken is the finalizer token managed by this controller
+	finalizerToken api.FinalizerName
 }
 
 // NewNamespaceController creates a new NamespaceController
-func NewNamespaceController(kubeClient clientset.Interface, versions *unversioned.APIVersions, resyncPeriod time.Duration) *NamespaceController {
+func NewNamespaceController(
+	kubeClient clientset.Interface,
+	clientPool dynamic.ClientPool,
+	groupVersionResources []unversioned.GroupVersionResource,
+	resyncPeriod time.Duration,
+	finalizerToken api.FinalizerName) *NamespaceController {
 	// create the controller so we can inject the enqueue function
 	namespaceController := &NamespaceController{
 		kubeClient: kubeClient,
-		versions:   versions,
-		queue:      workqueue.New(),
+		clientPool: clientPool,
+		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		groupVersionResources: groupVersionResources,
+		opCache:               operationNotSupportedCache{},
+		finalizerToken:        finalizerToken,
+	}
+
+	if kubeClient != nil && kubeClient.Core().GetRESTClient().GetRateLimiter() != nil {
+		metrics.RegisterMetricAndTrackRateLimiterUsage("namespace_controller", kubeClient.Core().GetRESTClient().GetRateLimiter())
 	}
 
 	// configure the backing store/controller
@@ -102,24 +122,40 @@ func (nm *NamespaceController) enqueueNamespace(obj interface{}) {
 // The system ensures that no two workers can process
 // the same namespace at the same time.
 func (nm *NamespaceController) worker() {
+	workFunc := func() bool {
+		key, quit := nm.queue.Get()
+		if quit {
+			return true
+		}
+		defer nm.queue.Done(key)
+
+		err := nm.syncNamespaceFromKey(key.(string))
+		if err == nil {
+			// no error, forget this entry and return
+			nm.queue.Forget(key)
+			return false
+		}
+
+		if estimate, ok := err.(*contentRemainingError); ok {
+			t := estimate.Estimate/2 + 1
+			glog.V(4).Infof("Content remaining in namespace %s, waiting %d seconds", key, t)
+			nm.queue.AddAfter(key, time.Duration(t)*time.Second)
+
+		} else {
+			// rather than wait for a full resync, re-add the namespace to the queue to be processed
+			nm.queue.AddRateLimited(key)
+			utilruntime.HandleError(err)
+		}
+		return false
+
+	}
+
 	for {
-		func() {
-			key, quit := nm.queue.Get()
-			if quit {
-				return
-			}
-			defer nm.queue.Done(key)
-			if err := nm.syncNamespaceFromKey(key.(string)); err != nil {
-				if estimate, ok := err.(*contentRemainingError); ok {
-					go func() {
-						t := estimate.Estimate/2 + 1
-						glog.V(4).Infof("Content remaining in namespace %s, waiting %d seconds", key, t)
-						time.Sleep(time.Duration(t) * time.Second)
-						nm.queue.Add(key)
-					}()
-				}
-			}
-		}()
+		quit := workFunc()
+
+		if quit {
+			return
+		}
 	}
 }
 
@@ -139,7 +175,7 @@ func (nm *NamespaceController) syncNamespaceFromKey(key string) (err error) {
 		return err
 	}
 	namespace := obj.(*api.Namespace)
-	return syncNamespace(nm.kubeClient, nm.versions, namespace)
+	return syncNamespace(nm.kubeClient, nm.clientPool, nm.opCache, nm.groupVersionResources, namespace, nm.finalizerToken)
 }
 
 // Run starts observing the system with the specified number of workers.

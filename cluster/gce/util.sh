@@ -23,11 +23,37 @@ source "${KUBE_ROOT}/cluster/gce/${KUBE_CONFIG_FILE-"config-default.sh"}"
 source "${KUBE_ROOT}/cluster/common.sh"
 source "${KUBE_ROOT}/cluster/lib/util.sh"
 
-if [[ "${OS_DISTRIBUTION}" == "debian" || "${OS_DISTRIBUTION}" == "coreos" || "${OS_DISTRIBUTION}" == "trusty" ]]; then
+if [[ "${OS_DISTRIBUTION}" == "debian" || "${OS_DISTRIBUTION}" == "coreos" || "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "gci" ]]; then
   source "${KUBE_ROOT}/cluster/gce/${OS_DISTRIBUTION}/helper.sh"
 else
   echo "Cannot operate on cluster using os distro: ${OS_DISTRIBUTION}" >&2
   exit 1
+fi
+
+if [[ "${OS_DISTRIBUTION}" == "gci" ]]; then
+  # If the master image is not set, we use the latest GCI dev image.
+  # Otherwise, we respect whatever is set by the user.
+  gci_images=( $(gcloud compute images list --project google-containers \
+      --show-deprecated --no-standard-images --sort-by='~creationTimestamp' \
+      --regexp='gci-[a-z]+-52-.*' --format='table[no-heading](name)') )
+  MASTER_IMAGE=${KUBE_GCE_MASTER_IMAGE:-"${gci_images[0]}"}
+  MASTER_IMAGE_PROJECT=${KUBE_GCE_MASTER_PROJECT:-google-containers}
+  # The default node image when using GCI is still the Debian based ContainerVM
+  # until GCI gets validated for node usage.
+  NODE_IMAGE=${KUBE_GCE_NODE_IMAGE:-${CVM_VERSION}}
+  NODE_IMAGE_PROJECT=${KUBE_GCE_NODE_PROJECT:-google-containers}
+fi
+
+# Verfiy cluster autoscaler configuration.
+if [[ "${ENABLE_CLUSTER_AUTOSCALER}" == "true" ]]; then
+  if [ -z $AUTOSCALER_MIN_NODES ]; then
+    echo "AUTOSCALER_MIN_NODES not set."
+    exit 1
+  fi
+  if [ -z $AUTOSCALER_MAX_NODES ]; then
+    echo "AUTOSCALER_MAX_NODES not set."
+    exit 1
+  fi
 fi
 
 NODE_INSTANCE_PREFIX="${INSTANCE_PREFIX}-minion"
@@ -100,7 +126,7 @@ function ensure-temp-dir {
 #   PROJECT_REPORTED
 function detect-project () {
   if [[ -z "${PROJECT-}" ]]; then
-    PROJECT=$(gcloud config list project | tail -n 1 | cut -f 3 -d ' ')
+    PROJECT=$(gcloud config list project --format 'value(core.project)')
   fi
 
   if [[ -z "${PROJECT-}" ]]; then
@@ -115,46 +141,71 @@ function detect-project () {
   fi
 }
 
-function already-staged() {
-  local -r file=$1
-  local -r newsum=$2
-
-  [[ -e "${file}.uploaded.sha1" ]] || return 1
-
-  local oldsum
-  oldsum=$(cat "${file}.uploaded.sha1")
-
-  [[ "${oldsum}" == "${newsum}" ]]
-}
-
-# Copy a release tar, if we don't already think it's staged in GCS
-function copy-if-not-staged() {
+# Copy a release tar and its accompanying hash.
+function copy-to-staging() {
   local -r staging_path=$1
   local -r gs_url=$2
   local -r tar=$3
   local -r hash=$4
 
-  if already-staged "${tar}" "${hash}"; then
-    echo "+++ $(basename ${tar}) already staged ('rm ${tar}.uploaded.sha1' to force)"
+  echo "${hash}" > "${tar}.sha1"
+  gsutil -m -q -h "Cache-Control:private, max-age=0" cp "${tar}" "${tar}.sha1" "${staging_path}"
+  gsutil -m acl ch -g all:R "${gs_url}" "${gs_url}.sha1" >/dev/null 2>&1
+  echo "+++ $(basename ${tar}) uploaded (sha1 = ${hash})"
+}
+
+# Given the cluster zone, return the list of regional GCS release
+# bucket suffixes for the release in preference order. GCS doesn't
+# give us an API for this, so we hardcode it.
+#
+# Assumed vars:
+#   RELEASE_REGION_FALLBACK
+#   REGIONAL_KUBE_ADDONS
+#   ZONE
+# Vars set:
+#   PREFERRED_REGION
+#   KUBE_ADDON_REGISTRY
+function set-preferred-region() {
+  case ${ZONE} in
+    asia-*)
+      PREFERRED_REGION=("asia" "us" "eu")
+      ;;
+    europe-*)
+      PREFERRED_REGION=("eu" "us" "asia")
+      ;;
+    *)
+      PREFERRED_REGION=("us" "eu" "asia")
+      ;;
+  esac
+  local -r preferred="${PREFERRED_REGION[0]}"
+
+  if [[ "${RELEASE_REGION_FALLBACK}" != "true" ]]; then
+    PREFERRED_REGION=( "${preferred}" )
+  fi
+
+  # If we're using regional GCR, and we're outside the US, go to the
+  # regional registry. The gcr.io/google_containers registry is
+  # appropriate for US (for now).
+  if [[ "${REGIONAL_KUBE_ADDONS}" == "true" ]] && [[ "${preferred}" != "us" ]]; then
+    KUBE_ADDON_REGISTRY="${preferred}.gcr.io/google_containers"
   else
-    echo "${hash}" > "${tar}.sha1"
-    gsutil -m -q -h "Cache-Control:private, max-age=0" cp "${tar}" "${tar}.sha1" "${staging_path}"
-    gsutil -m acl ch -g all:R "${gs_url}" "${gs_url}.sha1" >/dev/null 2>&1
-    echo "${hash}" > "${tar}.uploaded.sha1"
-    echo "+++ $(basename ${tar}) uploaded (sha1 = ${hash})"
+    KUBE_ADDON_REGISTRY="gcr.io/google_containers"
+  fi
+
+  if [[ "${ENABLE_DOCKER_REGISTRY_CACHE:-}" == "true" ]]; then
+    DOCKER_REGISTRY_MIRROR_URL="https://${preferred}-mirror.gcr.io"
   fi
 }
 
 # Take the local tar files and upload them to Google Storage.  They will then be
 # downloaded by the master as part of the start up script for the master.
-# If running on Ubuntu trusty, we also pack the dir cluster/gce/trusty/kube-manifest
-# and upload it to Google Storage.
 #
 # Assumed vars:
 #   PROJECT
 #   SERVER_BINARY_TAR
 #   SALT_TAR
 #   KUBE_MANIFESTS_TAR
+#   ZONE
 # Vars set:
 #   SERVER_BINARY_TAR_URL
 #   SERVER_BINARY_TAR_HASH
@@ -181,35 +232,62 @@ function upload-server-tars() {
   # that's probably good enough for now :P
   project_hash=${project_hash:0:10}
 
-  local -r staging_bucket="gs://kubernetes-staging-${project_hash}"
-
-  # Ensure the bucket is created
-  if ! gsutil ls "$staging_bucket" > /dev/null 2>&1 ; then
-    echo "Creating $staging_bucket"
-    gsutil mb "${staging_bucket}"
-  fi
-
-  local -r staging_path="${staging_bucket}/${INSTANCE_PREFIX}-devel"
+  set-preferred-region
 
   SERVER_BINARY_TAR_HASH=$(sha1sum-file "${SERVER_BINARY_TAR}")
   SALT_TAR_HASH=$(sha1sum-file "${SALT_TAR}")
-
-  echo "+++ Staging server tars to Google Storage: ${staging_path}"
-  local server_binary_gs_url="${staging_path}/${SERVER_BINARY_TAR##*/}"
-  local salt_gs_url="${staging_path}/${SALT_TAR##*/}"
-  copy-if-not-staged "${staging_path}" "${server_binary_gs_url}" "${SERVER_BINARY_TAR}" "${SERVER_BINARY_TAR_HASH}"
-  copy-if-not-staged "${staging_path}" "${salt_gs_url}" "${SALT_TAR}" "${SALT_TAR_HASH}"
-
-  # Convert from gs:// URL to an https:// URL
-  SERVER_BINARY_TAR_URL="${server_binary_gs_url/gs:\/\//https://storage.googleapis.com/}"
-  SALT_TAR_URL="${salt_gs_url/gs:\/\//https://storage.googleapis.com/}"
-
-  if [[ "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "coreos" ]]; then
-    local kube_manifests_gs_url="${staging_path}/${KUBE_MANIFESTS_TAR##*/}"
+  if [[ "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "gci" || "${OS_DISTRIBUTION}" == "coreos" ]]; then
     KUBE_MANIFESTS_TAR_HASH=$(sha1sum-file "${KUBE_MANIFESTS_TAR}")
-    copy-if-not-staged "${staging_path}" "${kube_manifests_gs_url}" "${KUBE_MANIFESTS_TAR}" "${KUBE_MANIFESTS_TAR_HASH}"
+  fi
+
+  local server_binary_tar_urls=()
+  local salt_tar_urls=()
+  local kube_manifest_tar_urls=()
+
+  for region in "${PREFERRED_REGION[@]}"; do
+    suffix="-${region}"
+    if [[ "${suffix}" == "-us" ]]; then
+      suffix=""
+    fi
+    local staging_bucket="gs://kubernetes-staging-${project_hash}${suffix}"
+
+    # Ensure the buckets are created
+    if ! gsutil ls "${staging_bucket}" ; then
+      echo "Creating ${staging_bucket}"
+      gsutil mb -l "${region}" "${staging_bucket}"
+    fi
+
+    local staging_path="${staging_bucket}/${INSTANCE_PREFIX}-devel"
+
+    echo "+++ Staging server tars to Google Storage: ${staging_path}"
+    local server_binary_gs_url="${staging_path}/${SERVER_BINARY_TAR##*/}"
+    local salt_gs_url="${staging_path}/${SALT_TAR##*/}"
+    copy-to-staging "${staging_path}" "${server_binary_gs_url}" "${SERVER_BINARY_TAR}" "${SERVER_BINARY_TAR_HASH}"
+    copy-to-staging "${staging_path}" "${salt_gs_url}" "${SALT_TAR}" "${SALT_TAR_HASH}"
+
     # Convert from gs:// URL to an https:// URL
-    KUBE_MANIFESTS_TAR_URL="${kube_manifests_gs_url/gs:\/\//https://storage.googleapis.com/}"
+    server_binary_tar_urls+=("${server_binary_gs_url/gs:\/\//https://storage.googleapis.com/}")
+    salt_tar_urls+=("${salt_gs_url/gs:\/\//https://storage.googleapis.com/}")
+
+    if [[ "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "gci" || "${OS_DISTRIBUTION}" == "coreos" ]]; then
+      local kube_manifests_gs_url="${staging_path}/${KUBE_MANIFESTS_TAR##*/}"
+      copy-to-staging "${staging_path}" "${kube_manifests_gs_url}" "${KUBE_MANIFESTS_TAR}" "${KUBE_MANIFESTS_TAR_HASH}"
+      # Convert from gs:// URL to an https:// URL
+      kube_manifests_tar_urls+=("${kube_manifests_gs_url/gs:\/\//https://storage.googleapis.com/}")
+    fi
+  done
+
+  if [[ "${OS_DISTRIBUTION}" == "coreos" ]]; then
+    # TODO: Support fallback .tar.gz settings on CoreOS
+    SERVER_BINARY_TAR_URL="${server_binary_tar_urls[0]}"
+    SALT_TAR_URL="${salt_tar_urls[0]}"
+    KUBE_MANIFESTS_TAR_URL="${kube_manifests_tar_urls[0]}"
+  else
+    SERVER_BINARY_TAR_URL=$(join_csv "${server_binary_tar_urls[@]}")
+    SALT_TAR_URL=$(join_csv "${salt_tar_urls[@]}")
+    if [[ "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "gci" ]]; then
+      KUBE_MANIFESTS_TAR_URL=$(join_csv "${kube_manifests_tar_urls[@]}")
+    fi
   fi
 }
 
@@ -223,20 +301,20 @@ function upload-server-tars() {
 function detect-node-names {
   detect-project
   INSTANCE_GROUPS=()
-  INSTANCE_GROUPS+=($(gcloud compute instance-groups managed list --zone "${ZONE}" --project "${PROJECT}" | grep ${NODE_INSTANCE_PREFIX} | cut -f1 -d" " || true))
+  INSTANCE_GROUPS+=($(gcloud compute instance-groups managed list \
+    --zone "${ZONE}" --project "${PROJECT}" \
+    --regexp "${NODE_INSTANCE_PREFIX}-.+" \
+    --format='value(instanceGroup)' || true))
   NODE_NAMES=()
   if [[ -n "${INSTANCE_GROUPS[@]:-}" ]]; then
     for group in "${INSTANCE_GROUPS[@]}"; do
       NODE_NAMES+=($(gcloud compute instance-groups managed list-instances \
         "${group}" --zone "${ZONE}" --project "${PROJECT}" \
-        --format=yaml | grep instance: | cut -d ' ' -f 2))
+        --format='value(instance)'))
     done
-    echo "INSTANCE_GROUPS=${INSTANCE_GROUPS[*]}" >&2
-    echo "NODE_NAMES=${NODE_NAMES[*]}" >&2
-  else 
-    echo "INSTANCE_GROUPS=" >&2
-    echo "NODE_NAMES=" >&2
   fi
+  echo "INSTANCE_GROUPS=${INSTANCE_GROUPS[*]:-}" >&2
+  echo "NODE_NAMES=${NODE_NAMES[*]:-}" >&2
 }
 
 # Detect the information about the minions
@@ -252,13 +330,12 @@ function detect-nodes () {
   KUBE_NODE_IP_ADDRESSES=()
   for (( i=0; i<${#NODE_NAMES[@]}; i++)); do
     local node_ip=$(gcloud compute instances describe --project "${PROJECT}" --zone "${ZONE}" \
-      "${NODE_NAMES[$i]}" --fields networkInterfaces[0].accessConfigs[0].natIP \
-      --format=text | awk '{ print $2 }')
+      "${NODE_NAMES[$i]}" --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
     if [[ -z "${node_ip-}" ]] ; then
       echo "Did not find ${NODE_NAMES[$i]}" >&2
     else
-      echo "Found ${NODE_NAMES[$i]} at ${minion_ip}"
-      KUBE_NODE_IP_ADDRESSES+=("${minion_ip}")
+      echo "Found ${NODE_NAMES[$i]} at ${node_ip}"
+      KUBE_NODE_IP_ADDRESSES+=("${node_ip}")
     fi
   done
   if [[ -z "${KUBE_NODE_IP_ADDRESSES-}" ]]; then
@@ -280,14 +357,26 @@ function detect-master () {
   KUBE_MASTER=${MASTER_NAME}
   if [[ -z "${KUBE_MASTER_IP-}" ]]; then
     KUBE_MASTER_IP=$(gcloud compute instances describe --project "${PROJECT}" --zone "${ZONE}" \
-      "${MASTER_NAME}" --fields networkInterfaces[0].accessConfigs[0].natIP \
-      --format=text | awk '{ print $2 }')
+      "${MASTER_NAME}" --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
   fi
   if [[ -z "${KUBE_MASTER_IP-}" ]]; then
     echo "Could not detect Kubernetes master node.  Make sure you've launched a cluster with 'kube-up.sh'" >&2
     exit 1
   fi
   echo "Using master: $KUBE_MASTER (external IP: $KUBE_MASTER_IP)"
+}
+
+# Reads kube-env metadata from master
+#
+# Assumed vars:
+#   KUBE_MASTER
+#   PROJECT
+#   ZONE
+function get-master-env() {
+  # TODO(zmerlynn): Make this more reliable with retries.
+  gcloud compute --project ${PROJECT} ssh --zone ${ZONE} ${KUBE_MASTER} --command \
+    "curl --fail --silent -H 'Metadata-Flavor: Google' \
+      'http://metadata/computeMetadata/v1/instance/attributes/kube-env'" 2>/dev/null
 }
 
 # Robustly try to create a static ip.
@@ -298,19 +387,27 @@ function create-static-ip {
   local attempt=0
   local REGION="$2"
   while true; do
-    if ! gcloud compute addresses create "$1" \
+    if gcloud compute addresses create "$1" \
       --project "${PROJECT}" \
       --region "${REGION}" -q > /dev/null; then
-      if (( attempt > 4 )); then
-        echo -e "${color_red}Failed to create static ip $1 ${color_norm}" >&2
-        exit 2
-      fi
-      attempt=$(($attempt+1)) 
-      echo -e "${color_yellow}Attempt $attempt failed to create static ip $1. Retrying.${color_norm}" >&2
-      sleep $(($attempt * 5))
-    else
+      # successful operation
       break
     fi
+
+    if cloud compute addresses describe "$1" \
+      --project "${PROJECT}" \
+      --region "${REGION}" >/dev/null 2>&1; then
+      # it exists - postcondition satisfied
+      break
+    fi
+
+    if (( attempt > 4 )); then
+      echo -e "${color_red}Failed to create static ip $1 ${color_norm}" >&2
+      exit 2
+    fi
+    attempt=$(($attempt+1))
+    echo -e "${color_yellow}Attempt $attempt failed to create static ip $1. Retrying.${color_norm}" >&2
+    sleep $(($attempt * 5))
   done
 }
 
@@ -350,9 +447,7 @@ function get-template-name-from-version {
 # Robustly try to create an instance template.
 # $1: The name of the instance template.
 # $2: The scopes flag.
-# $3: The minion start script metadata from file.
-# $4: The kube-env metadata.
-# $5 and others: Additional user defined metadata.
+# $3 and others: Metadata entries (must all be from a file).
 function create-node-template {
   detect-project
   local template_name="$1"
@@ -396,6 +491,11 @@ function create-node-template {
         echo -e "${color_yellow}Attempt ${attempt} failed to create instance template $template_name. Retrying.${color_norm}" >&2
         attempt=$(($attempt+1))
         sleep $(($attempt * 5))
+
+        # In case the previous attempt failed with something like a
+        # Backend Error and left the entry laying around, delete it
+        # before we try again.
+        gcloud compute instance-templates delete "$template_name" --project "${PROJECT}" &>/dev/null || true
     else
         break
     fi
@@ -477,16 +577,17 @@ function kube-up {
   set_num_migs
 
   if [[ ${KUBE_USE_EXISTING_MASTER:-} == "true" ]]; then
+    parse-master-env
     create-nodes
-    create-autoscaler
   else
     check-existing
     create-network
+    write-cluster-name
+    create-autoscaler-config
     create-master
     create-nodes-firewall
     create-nodes-template
     create-nodes
-    create-autoscaler
     check-cluster
   fi
 }
@@ -539,6 +640,18 @@ function create-network() {
   fi
 }
 
+# Assumes:
+#   NUM_NODES
+# Sets:
+#   MASTER_ROOT_DISK_SIZE
+function get-master-root-disk-size() {
+  if [[ "${NUM_NODES}" -le "1000" ]]; then
+    export MASTER_ROOT_DISK_SIZE="10"
+  else
+    export MASTER_ROOT_DISK_SIZE="50"
+  fi
+}
+
 function create-master() {
   echo "Starting master and configuring firewalls"
   gcloud compute firewall-rules create "${MASTER_NAME}-https" \
@@ -578,10 +691,12 @@ function create-master() {
   local REGION=${ZONE%-*}
   create-static-ip "${MASTER_NAME}-ip" "${REGION}"
   MASTER_RESERVED_IP=$(gcloud compute addresses describe "${MASTER_NAME}-ip" \
-    --project "${PROJECT}" \
-    --region "${REGION}" -q --format yaml | awk '/^address:/ { print $2 }')
+    --project "${PROJECT}" --region "${REGION}" -q --format='value(address)')
 
   create-certs "${MASTER_RESERVED_IP}"
+
+  # Sets MASTER_ROOT_DISK_SIZE that is used by create-master-instance
+  get-master-root-disk-size
 
   create-master-instance "${MASTER_RESERVED_IP}" &
 }
@@ -616,20 +731,25 @@ function create-nodes-template() {
 
   local template_name="${NODE_INSTANCE_PREFIX}-template"
 
+  # For master on GCI or trusty, we support the hybrid mode with nodes on ContainerVM.
+  if [[ "${OS_DISTRIBUTION}" == "trusty" || "${OS_DISTRIBUTION}" == "gci" ]] && \
+     [[ "${NODE_IMAGE}" == container* ]]; then
+    source "${KUBE_ROOT}/cluster/gce/debian/helper.sh"
+  fi
   create-node-instance-template $template_name
 }
 
 # Assumes:
 # - MAX_INSTANCES_PER_MIG
 # - NUM_NODES
-# exports: 
+# exports:
 # - NUM_MIGS
 function set_num_migs() {
-  local defaulted_max_instances_per_mig=${MAX_INSTANCES_PER_MIG:-500}
+  local defaulted_max_instances_per_mig=${MAX_INSTANCES_PER_MIG:-1000}
 
   if [[ ${defaulted_max_instances_per_mig} -le "0" ]]; then
-    echo "MAX_INSTANCES_PER_MIG cannot be negative. Assuming default 500"
-    defaulted_max_instances_per_mig=500
+    echo "MAX_INSTANCES_PER_MIG cannot be negative. Assuming default 1000"
+    defaulted_max_instances_per_mig=1000
   fi
   export NUM_MIGS=$(((${NUM_NODES} + ${defaulted_max_instances_per_mig} - 1) / ${defaulted_max_instances_per_mig}))
 }
@@ -643,37 +763,32 @@ function set_num_migs() {
 function create-nodes() {
   local template_name="${NODE_INSTANCE_PREFIX}-template"
 
-  local instances_per_mig=$(((${NUM_NODES} + ${NUM_MIGS} - 1) / ${NUM_MIGS}))
-  local last_mig_size=$((${NUM_NODES} - (${NUM_MIGS} - 1) * ${instances_per_mig}))
+  local instances_left=${NUM_NODES}
 
   #TODO: parallelize this loop to speed up the process
-  for ((i=1; i<${NUM_MIGS}; i++)); do
+  for ((i=1; i<=${NUM_MIGS}; i++)); do
+    local group_name="${NODE_INSTANCE_PREFIX}-group-$i"
+    if [[ $i == ${NUM_MIGS} ]]; then
+      # TODO: We don't add a suffix for the last group to keep backward compatibility when there's only one MIG.
+      # We should change it at some point, but note #18545 when changing this.
+      group_name="${NODE_INSTANCE_PREFIX}-group"
+    fi
+    # Spread the remaining number of nodes evenly
+    this_mig_size=$((${instances_left} / (${NUM_MIGS}-${i}+1)))
+    instances_left=$((instances_left-${this_mig_size}))
+    
     gcloud compute instance-groups managed \
-        create "${NODE_INSTANCE_PREFIX}-group-$i" \
+        create "${group_name}" \
         --project "${PROJECT}" \
         --zone "${ZONE}" \
-        --base-instance-name "${NODE_INSTANCE_PREFIX}" \
-        --size "${instances_per_mig}" \
+        --base-instance-name "${group_name}" \
+        --size "${this_mig_size}" \
         --template "$template_name" || true;
     gcloud compute instance-groups managed wait-until-stable \
-        "${NODE_INSTANCE_PREFIX}-group-$i" \
-	      --zone "${ZONE}" \
-	      --project "${PROJECT}" || true;
+        "${group_name}" \
+        --zone "${ZONE}" \
+        --project "${PROJECT}" || true;
   done
-
-  # TODO: We don't add a suffix for the last group to keep backward compatibility when there's only one MIG.
-  # We should change it at some point, but note #18545 when changing this.
-  gcloud compute instance-groups managed \
-      create "${NODE_INSTANCE_PREFIX}-group" \
-      --project "${PROJECT}" \
-      --zone "${ZONE}" \
-      --base-instance-name "${NODE_INSTANCE_PREFIX}" \
-      --size "${last_mig_size}" \
-      --template "$template_name" || true;
-  gcloud compute instance-groups managed wait-until-stable \
-      "${NODE_INSTANCE_PREFIX}-group" \
-      --zone "${ZONE}" \
-      --project "${PROJECT}" || true;
 }
 
 # Assumes:
@@ -681,39 +796,66 @@ function create-nodes() {
 # - NODE_INSTANCE_PREFIX
 # - PROJECT
 # - ZONE
-# - ENABLE_NODE_AUTOSCALER
-# - TARGET_NODE_UTILIZATION\
 # - AUTOSCALER_MAX_NODES
 # - AUTOSCALER_MIN_NODES
-function create-autoscaler() {
-  # Create autoscaler for nodes if requested
-  if [[ "${ENABLE_NODE_AUTOSCALER}" == "true" ]]; then
-    local metrics=""
-    # Current usage
-    metrics+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/cpu/node_utilization,"
-    metrics+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
-    metrics+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/memory/node_utilization,"
-    metrics+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
+# Exports
+# - AUTOSCALER_MIG_CONFIG
+function create-cluster-autoscaler-mig-config() {
 
-    # Reservation
-    metrics+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/cpu/node_reservation,"
-    metrics+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
-    metrics+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/memory/node_reservation,"
-    metrics+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
+  # Each MIG must have at least one node, so the min number of nodes
+  # must be greater or equal to the number of migs. 
+  if [[ ${AUTOSCALER_MIN_NODES} < ${NUM_MIGS} ]]; then
+    echo "AUTOSCALER_MIN_NODES must be greater or equal ${NUM_MIGS}"
+    exit 2
+  fi
 
-    echo "Creating node autoscalers."
+  # Each MIG must have at least one node, so the min number of nodes
+  # must be greater or equal to the number of migs. 
+  if [[ ${AUTOSCALER_MAX_NODES} < ${NUM_MIGS} ]]; then
+    echo "AUTOSCALER_MAX_NODES must be greater or equal ${NUM_MIGS}"
+    exit 2
+  fi
 
-    local max_instances_per_mig=$(((${AUTOSCALER_MAX_NODES} + ${NUM_MIGS} - 1) / ${NUM_MIGS}))
-    local last_max_instances=$((${AUTOSCALER_MAX_NODES} - (${NUM_MIGS} - 1) * ${max_instances_per_mig}))
-    local min_instances_per_mig=$(((${AUTOSCALER_MIN_NODES} + ${NUM_MIGS} - 1) / ${NUM_MIGS}))
-    local last_min_instances=$((${AUTOSCALER_MIN_NODES} - (${NUM_MIGS} - 1) * ${min_instances_per_mig}))
+  # The code assumes that the migs were created with create-nodes 
+  # function which tries to evenly spread nodes across the migs.
+  AUTOSCALER_MIG_CONFIG=""
 
-    for ((i=1; i<${NUM_MIGS}; i++)); do
-      gcloud compute instance-groups managed set-autoscaling "${NODE_INSTANCE_PREFIX}-group-$i" --zone "${ZONE}" --project "${PROJECT}" \
-          --min-num-replicas "${min_instances_per_mig}" --max-num-replicas "${max_instances_per_mig}" ${metrics} || true
-    done
-    gcloud compute instance-groups managed set-autoscaling "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project "${PROJECT}" \
-      --min-num-replicas "${last_min_instances}" --max-num-replicas "${last_max_instances}" ${metrics} || true
+  local left_min=${AUTOSCALER_MIN_NODES}
+  local left_max=${AUTOSCALER_MAX_NODES}
+
+  for ((i=1; i<=${NUM_MIGS}; i++)); do
+    local group_name="${NODE_INSTANCE_PREFIX}-group-$i"
+    if [[ $i == ${NUM_MIGS} ]]; then
+      # TODO: We don't add a suffix for the last group to keep backward compatibility when there's only one MIG.
+      # We should change it at some point, but note #18545 when changing this.
+      group_name="${NODE_INSTANCE_PREFIX}-group"
+    fi
+
+    this_mig_min=$((${left_min}/(${NUM_MIGS}-${i}+1)))
+    this_mig_max=$((${left_max}/(${NUM_MIGS}-${i}+1)))
+    left_min=$((left_min-$this_mig_min))
+    left_max=$((left_max-$this_mig_max))
+
+    local mig_url="https://www.googleapis.com/compute/v1/projects/${PROJECT}/zones/${ZONE}/instanceGroups/${group_name}"
+    AUTOSCALER_MIG_CONFIG="${AUTOSCALER_MIG_CONFIG} --nodes=${this_mig_min}:${this_mig_max}:${mig_url}"
+  done
+
+  AUTOSCALER_MIG_CONFIG="${AUTOSCALER_MIG_CONFIG} --scale-down-enabled=${AUTOSCALER_ENABLE_SCALE_DOWN}"
+}
+
+# Assumes:
+# - NUM_MIGS
+# - NODE_INSTANCE_PREFIX
+# - PROJECT
+# - ZONE
+# - ENABLE_CLUSTER_AUTOSCALER
+# - AUTOSCALER_MAX_NODES
+# - AUTOSCALER_MIN_NODES
+function create-autoscaler-config() {
+  # Create autoscaler for nodes configuration if requested
+  if [[ "${ENABLE_CLUSTER_AUTOSCALER}" == "true" ]]; then
+    create-cluster-autoscaler-mig-config
+    echo "Using autoscaler config: ${AUTOSCALER_MIG_CONFIG}"
   fi
 }
 
@@ -744,27 +886,6 @@ function check-cluster() {
       local elapsed=$(($(date +%s) - ${start_time}))
       if [[ ${elapsed} -gt ${KUBE_CLUSTER_INITIALIZATION_TIMEOUT} ]]; then
           echo -e "${color_red}Cluster failed to initialize within ${KUBE_CLUSTER_INITIALIZATION_TIMEOUT} seconds.${color_norm}" >&2
-          if [[ ${KUBE_TEST_DEBUG-} =~ ^[yY]$ ]]; then
-            local savedir="${E2E_REPORT_DIR-}"
-            if [[ -z "${savedir}" ]]; then
-              savedir="$(mktemp -t -d k8s-e2e.XXX)"
-            fi
-            echo "Preserving master logs in ${savedir}"
-            local logdir=/var/log
-            local basename
-            for basename in startupscript kube-apiserver; do
-              # TODO(mml): Perhaps revisit how we name logs for preservation and
-              # centralize an implementation.  Options include putting basename
-              # before hostname and including a timestamp.
-              local src="${logdir}/${basename}.log"
-              local dst="${savedir}/${MASTER_NAME}-${basename}.log"
-              echo "Copying ${MASTER_NAME}:${src}"
-              gcloud compute copy-files \
-                --project "${PROJECT}" --zone "${ZONE}" \
-                "${MASTER_NAME}:${src}" "${dst}" \
-                || true
-            done
-          fi
           exit 2
       fi
       printf "."
@@ -779,7 +900,18 @@ function check-cluster() {
   export CONTEXT="${PROJECT}_${INSTANCE_PREFIX}"
   (
    umask 077
+
+   # Update the user's kubeconfig to include credentials for this apiserver.
    create-kubeconfig
+
+   if [[ "${FEDERATION:-}" == "true" ]]; then
+       # Create a kubeconfig with credentials for this apiserver. We will later use
+       # this kubeconfig to create a secret which the federation control plane can
+       # use to talk to this apiserver.
+       KUBECONFIG_DIR=$(dirname ${KUBECONFIG:-$DEFAULT_KUBECONFIG})
+       KUBECONFIG="${KUBECONFIG_DIR}/federation/kubernetes-apiserver/${CONTEXT}/kubeconfig" \
+         create-kubeconfig
+   fi
   )
 
   # ensures KUBECONFIG is set
@@ -812,9 +944,9 @@ function kube-down {
 
   # Delete autoscaler for nodes if present. We assume that all or none instance groups have an autoscaler
   local autoscaler
-  autoscaler=( $(gcloud compute instance-groups managed list --zone "${ZONE}" --project "${PROJECT}" \
-                 | grep "${NODE_INSTANCE_PREFIX}-group" \
-                 | awk '{print $7}') )
+  autoscaler=( $(gcloud compute instance-groups managed list \
+    --zone "${ZONE}" --project "${PROJECT}" --regexp="${NODE_INSTANCE_PREFIX}-.+" \
+    --format='value(autoscaled)') )
   if [[ "${autoscaler:-}" == "yes" ]]; then
     for group in ${INSTANCE_GROUPS[@]:-}; do
       gcloud compute instance-groups managed stop-autoscaling "${group}" --zone "${ZONE}" --project "${PROJECT}"
@@ -824,30 +956,15 @@ function kube-down {
   # Get the name of the managed instance group template before we delete the
   # managed instance group. (The name of the managed instance group template may
   # change during a cluster upgrade.)
-  local template=$(get-template "${PROJECT}" "${ZONE}" "${NODE_INSTANCE_PREFIX}-group")
+  local template=$(get-template "${PROJECT}")
 
-  # The gcloud APIs don't return machine parseable error codes/retry information. Therefore the best we can
-  # do is parse the output and special case particular responses we are interested in.
   for group in ${INSTANCE_GROUPS[@]:-}; do
     if gcloud compute instance-groups managed describe "${group}" --project "${PROJECT}" --zone "${ZONE}" &>/dev/null; then
-      deleteCmdOutput=$(gcloud compute instance-groups managed delete --zone "${ZONE}" \
+      gcloud compute instance-groups managed delete \
         --project "${PROJECT}" \
         --quiet \
-        "${group}")
-      if [[ "$deleteCmdOutput" != ""  ]]; then
-        # Managed instance group deletion is done asynchronously, we must wait for it to complete, or subsequent steps fail
-        deleteCmdOperationId=$(echo $deleteCmdOutput | grep "Operation:" | sed "s/.*Operation:[[:space:]]*\([^[:space:]]*\).*/\1/g")
-        if [[ "$deleteCmdOperationId" != ""  ]]; then
-          deleteCmdStatus="PENDING"
-          while [[ "$deleteCmdStatus" != "DONE" ]]
-          do
-            sleep 5
-            deleteCmdOperationOutput=$(gcloud compute instance-groups managed --zone "${ZONE}" --project "${PROJECT}" get-operation $deleteCmdOperationId)
-            deleteCmdStatus=$(echo $deleteCmdOperationOutput | grep -i "status:" | sed "s/.*status:[[:space:]]*\([^[:space:]]*\).*/\1/g")
-            echo "Waiting for MIG deletion to complete. Current status: " $deleteCmdStatus
-          done
-        fi
-      fi
+        --zone "${ZONE}" \
+        "${group}"
     fi
   done
 
@@ -893,7 +1010,7 @@ function kube-down {
   minions=( $(gcloud compute instances list \
                 --project "${PROJECT}" --zone "${ZONE}" \
                 --regexp "${NODE_INSTANCE_PREFIX}-.+" \
-                | awk 'NR >= 2 { print $1 }') )
+                --format='value(name)') )
   # If any minions are running, delete them in batches.
   while (( "${#minions[@]}" > 0 )); do
     echo Deleting nodes "${minions[*]::10}"
@@ -931,7 +1048,8 @@ function kube-down {
   # first allows the master to cleanup routes itself.
   local TRUNCATED_PREFIX="${INSTANCE_PREFIX:0:26}"
   routes=( $(gcloud compute routes list --project "${PROJECT}" \
-    --regexp "${TRUNCATED_PREFIX}-.{8}-.{4}-.{4}-.{4}-.{12}" | awk 'NR >= 2 { print $1 }') )
+    --regexp "${TRUNCATED_PREFIX}-.{8}-.{4}-.{4}-.{4}-.{12}"  \
+    --format='value(name)') )
   while (( "${#routes[@]}" > 0 )); do
     echo Deleting routes "${routes[*]::10}"
     gcloud compute routes delete \
@@ -956,21 +1074,16 @@ function kube-down {
   set -e
 }
 
-# Gets the instance template for the managed instance group with the provided
-# project, zone, and group name. It echos the template name so that the function
+# Gets the instance template for given NODE_INSTANCE_PREFIX. It echos the template name so that the function
 # output can be used.
+# Assumed vars:
+#   NODE_INSTANCE_PREFIX
 #
 # $1: project
-# $2: zone
-# $3: managed instance group name
 function get-template {
-  # url is set to https://www.googleapis.com/compute/v1/projects/$1/global/instanceTemplates/<template>
-  local url=$(gcloud compute instance-groups managed describe --project="${1}" --zone="${2}" "${3}" | grep instanceTemplate)
-  # template is set to <template> (the pattern strips off all but last slash)
-  local template="${url##*/}"
-  echo "${template}"
+  gcloud compute instance-templates list "${NODE_INSTANCE_PREFIX}-template" \
+    --project="${1}" --format='value(name)'
 }
-
 
 # Checks if there are any present resources related kubernetes cluster.
 #
@@ -1017,7 +1130,7 @@ function check-resources {
   minions=( $(gcloud compute instances list \
                 --project "${PROJECT}" --zone "${ZONE}" \
                 --regexp "${NODE_INSTANCE_PREFIX}-.+" \
-                | awk 'NR >= 2 { print $1 }') )
+                --format='value(name)') )
   if (( "${#minions[@]}" > 0 )); then
     KUBE_RESOURCE_FOUND="${#minions[@]} matching matching ${NODE_INSTANCE_PREFIX}-.+"
     return 1
@@ -1035,7 +1148,7 @@ function check-resources {
 
   local -a routes
   routes=( $(gcloud compute routes list --project "${PROJECT}" \
-    --regexp "${INSTANCE_PREFIX}-minion-.{4}" | awk 'NR >= 2 { print $1 }') )
+    --regexp "${INSTANCE_PREFIX}-minion-.{4}" --format='value(name)') )
   if (( "${#routes[@]}" > 0 )); then
     KUBE_RESOURCE_FOUND="${#routes[@]} routes matching ${INSTANCE_PREFIX}-minion-.{4}"
     return 1
@@ -1125,10 +1238,11 @@ function prepare-push() {
 function push-master {
   echo "Updating master metadata ..."
   write-master-env
-  add-instance-metadata-from-file "${KUBE_MASTER}" "kube-env=${KUBE_TEMP}/master-kube-env.yaml" "startup-script=${KUBE_ROOT}/cluster/gce/configure-vm.sh"
+  prepare-startup-script
+  add-instance-metadata-from-file "${KUBE_MASTER}" "kube-env=${KUBE_TEMP}/master-kube-env.yaml" "startup-script=${KUBE_TEMP}/configure-vm.sh"
 
   echo "Pushing to master (log at ${OUTPUT}/push-${KUBE_MASTER}.log) ..."
-  cat ${KUBE_ROOT}/cluster/gce/configure-vm.sh | gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone "${ZONE}" "${KUBE_MASTER}" --command "sudo bash -s -- --push" &> ${OUTPUT}/push-"${KUBE_MASTER}".log
+  cat ${KUBE_TEMP}/configure-vm.sh | gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone "${ZONE}" "${KUBE_MASTER}" --command "sudo bash -s -- --push" &> ${OUTPUT}/push-"${KUBE_MASTER}".log
 }
 
 # Push binaries to kubernetes node
@@ -1136,10 +1250,11 @@ function push-node() {
   node=${1}
 
   echo "Updating node ${node} metadata... "
-  add-instance-metadata-from-file "${node}" "kube-env=${KUBE_TEMP}/node-kube-env.yaml" "startup-script=${KUBE_ROOT}/cluster/gce/configure-vm.sh"
+  prepare-startup-script
+  add-instance-metadata-from-file "${node}" "kube-env=${KUBE_TEMP}/node-kube-env.yaml" "startup-script=${KUBE_TEMP}/configure-vm.sh"
 
   echo "Start upgrading node ${node} (log at ${OUTPUT}/push-${node}.log) ..."
-  cat ${KUBE_ROOT}/cluster/gce/configure-vm.sh | gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone "${ZONE}" "${node}" --command "sudo bash -s -- --push" &> ${OUTPUT}/push-"${node}".log
+  cat ${KUBE_TEMP}/configure-vm.sh | gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone "${ZONE}" "${node}" --command "sudo bash -s -- --push" &> ${OUTPUT}/push-"${node}".log
 }
 
 # Push binaries to kubernetes cluster
@@ -1180,7 +1295,7 @@ function kube-push {
 }
 
 # -----------------------------------------------------------------------------
-# Cluster specific test helpers used from hack/e2e-test.sh
+# Cluster specific test helpers used from hack/e2e.go
 
 # Execute prior to running tests to build a release if required for env.
 #
@@ -1192,13 +1307,23 @@ function test-build-release {
 }
 
 # Execute prior to running tests to initialize required structure. This is
-# called from hack/e2e.go only when running -up (it is run after kube-up).
+# called from hack/e2e.go only when running -up.
 #
 # Assumed vars:
 #   Variables from config.sh
 function test-setup {
   # Detect the project into $PROJECT if it isn't set
   detect-project
+
+  if [[ ${MULTIZONE:-} == "true" ]]; then
+    for KUBE_GCE_ZONE in ${E2E_ZONES}
+    do
+      KUBE_GCE_ZONE="${KUBE_GCE_ZONE}" KUBE_USE_EXISTING_MASTER="${KUBE_USE_EXISTING_MASTER:-}" "${KUBE_ROOT}/cluster/kube-up.sh"
+      KUBE_USE_EXISTING_MASTER="true" # For subsequent zones we use the existing master
+    done
+  else
+    "${KUBE_ROOT}/cluster/kube-up.sh"
+  fi
 
   # Open up port 80 & 8080 so common containers on minions can be reached
   # TODO(roberthbailey): Remove this once we are no longer relying on hostPorts.
@@ -1271,30 +1396,23 @@ function ssh-to-node {
   local cmd="$2"
   # Loop until we can successfully ssh into the box
   for try in $(seq 1 5); do
-    if gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone="${ZONE}" "${node}" --command "echo test > /dev/null"; then
+    if gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --ssh-flag="-o ConnectTimeout=30" --project "${PROJECT}" --zone="${ZONE}" "${node}" --command "echo test > /dev/null"; then
       break
     fi
     sleep 5
   done
   # Then actually try the command.
-  gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --project "${PROJECT}" --zone="${ZONE}" "${node}" --command "${cmd}"
-}
-
-# Restart the kube-proxy on a node ($1)
-function restart-kube-proxy {
-  if [[ "${OS_DISTRIBUTION}" == "trusty" ]]; then
-    ssh-to-node "$1" "sudo initctl restart kube-proxy"
-  else
-    ssh-to-node "$1" "sudo /etc/init.d/kube-proxy restart"
-  fi
-}
-
-# Restart the kube-apiserver on a node ($1)
-function restart-apiserver {
-  ssh-to-node "$1" "sudo docker ps | grep /kube-apiserver | cut -d ' ' -f 1 | xargs sudo docker kill"
+  gcloud compute ssh --ssh-flag="-o LogLevel=quiet" --ssh-flag="-o ConnectTimeout=30" --project "${PROJECT}" --zone="${ZONE}" "${node}" --command "${cmd}"
 }
 
 # Perform preparations required to run e2e tests
 function prepare-e2e() {
   detect-project
+}
+
+# Writes configure-vm.sh to a temporary location with comments stripped. GCE
+# limits the size of metadata fields to 32K, and stripping comments is the
+# easiest way to buy us a little more room.
+function prepare-startup-script() {
+  sed '/^\s*#\([^!].*\)*$/ d' ${KUBE_ROOT}/cluster/gce/configure-vm.sh > ${KUBE_TEMP}/configure-vm.sh
 }

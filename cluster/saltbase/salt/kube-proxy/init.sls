@@ -16,6 +16,13 @@
     - mode: 644
     - makedirs: true
     - dir_mode: 755
+    - context:
+        # 20m might cause kube-proxy CPU starvation on full nodes, resulting in
+        # delayed service updates. But, giving it more would be a breaking change 
+        # to the overhead requirements for existing clusters.
+        # Any change here should be accompanied by a proportional change in CPU
+        # requests of other per-node add-ons (e.g. fluentd).
+        cpurequest: '20m'
     - require:
       - service: docker
       - service: kubelet
@@ -26,7 +33,7 @@
     - group: root
     - mode: 644
 
-#stop legacy kube-proxy service 
+#stop legacy kube-proxy service
 stop_kube-proxy:
   service.dead:
     - name: kube-proxy

@@ -50,9 +50,10 @@ var (
 )
 
 var (
-	ErrRunContainer  = errors.New("RunContainerError")
-	ErrKillContainer = errors.New("KillContainerError")
-	ErrVerifyNonRoot = errors.New("VerifyNonRootError")
+	ErrRunContainer     = errors.New("RunContainerError")
+	ErrKillContainer    = errors.New("KillContainerError")
+	ErrVerifyNonRoot    = errors.New("VerifyNonRootError")
+	ErrRunInitContainer = errors.New("RunInitContainerError")
 )
 
 var (
@@ -69,6 +70,7 @@ const (
 	KillContainer   SyncAction = "KillContainer"
 	SetupNetwork    SyncAction = "SetupNetwork"
 	TeardownNetwork SyncAction = "TeardownNetwork"
+	InitContainer   SyncAction = "InitContainer"
 )
 
 // SyncResult is the result of sync action.
@@ -114,7 +116,7 @@ func (p *PodSyncResult) AddPodSyncResult(result PodSyncResult) {
 	p.SyncError = result.SyncError
 }
 
-// Fail fails the PodSyncResult with an error occured in SyncPod() and KillPod() itself
+// Fail fails the PodSyncResult with an error occurred in SyncPod() and KillPod() itself
 func (p *PodSyncResult) Fail(err error) {
 	p.SyncError = err
 }

@@ -20,12 +20,14 @@ import (
 	"path/filepath"
 	"strings"
 
+	clientgenargs "k8s.io/kubernetes/cmd/libs/go2idl/client-gen/args"
+	"k8s.io/kubernetes/cmd/libs/go2idl/client-gen/generators/normalization"
 	"k8s.io/kubernetes/cmd/libs/go2idl/generator"
 	"k8s.io/kubernetes/cmd/libs/go2idl/types"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 )
 
-func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packageBasePath string, srcTreePath string, boilerplate []byte) generator.Package {
+func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packageBasePath string, srcTreePath string, inputPath string, boilerplate []byte, generatedBy string) generator.Package {
 	outputPackagePath := filepath.Join(packageBasePath, gv.Group, gv.Version, "fake")
 	// TODO: should make this a function, called by here and in client-generator.go
 	realClientPath := filepath.Join(packageBasePath, gv.Group, gv.Version)
@@ -34,7 +36,8 @@ func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packag
 		PackagePath: outputPackagePath,
 		HeaderText:  boilerplate,
 		PackageDocumentation: []byte(
-			`// Package fake has the automatically generated clients.
+			generatedBy +
+				`// Package fake has the automatically generated clients.
 `),
 		// GeneratorFunc returns a list of generators. Each generator makes a
 		// single file.
@@ -51,7 +54,9 @@ func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packag
 						OptionalName: "fake_" + strings.ToLower(c.Namers["private"].Name(t)),
 					},
 					outputPackage: outputPackagePath,
-					group:         gv.Group,
+					group:         normalization.BeforeFirstDot(gv.Group),
+					inputPackage:  inputPath,
+					version:       gv.Version,
 					typeToMatch:   t,
 					imports:       generator.NewImportTracker(),
 				})
@@ -59,11 +64,11 @@ func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packag
 
 			generators = append(generators, &genFakeForGroup{
 				DefaultGen: generator.DefaultGen{
-					OptionalName: "fake_" + gv.Group + "_client",
+					OptionalName: "fake_" + normalization.BeforeFirstDot(gv.Group) + "_client",
 				},
 				outputPackage:  outputPackagePath,
 				realClientPath: realClientPath,
-				group:          gv.Group,
+				group:          normalization.BeforeFirstDot(gv.Group),
 				types:          typeList,
 				imports:        generator.NewImportTracker(),
 			})
@@ -75,28 +80,33 @@ func PackageForGroup(gv unversioned.GroupVersion, typeList []*types.Type, packag
 	}
 }
 
-func PackageForClientset(typedClientBasePath string, groupVersions []unversioned.GroupVersion, boilerplate []byte) generator.Package {
+func PackageForClientset(customArgs clientgenargs.Args, typedClientBasePath string, boilerplate []byte, generatedBy string) generator.Package {
 	return &generator.DefaultPackage{
 		// TODO: we'll generate fake clientset for different release in the future.
 		// Package name and path are hard coded for now.
 		PackageName: "fake",
-		PackagePath: "k8s.io/kubernetes/pkg/client/testing/fake",
+		PackagePath: filepath.Join(customArgs.ClientsetOutputPath, customArgs.ClientsetName, "fake"),
 		HeaderText:  boilerplate,
 		PackageDocumentation: []byte(
-			`// This package has the automatically generated fake clientset.
+			generatedBy +
+				`// This package has the automatically generated fake clientset.
 `),
 		// GeneratorFunc returns a list of generators. Each generator generates a
 		// single file.
 		GeneratorFunc: func(c *generator.Context) (generators []generator.Generator) {
 			generators = []generator.Generator{
+				// Always generate a "doc.go" file.
+				generator.DefaultGen{OptionalName: "doc"},
+
 				&genClientset{
 					DefaultGen: generator.DefaultGen{
 						OptionalName: "clientset_generated",
 					},
-					groupVersions:   groupVersions,
+					groupVersions:   customArgs.GroupVersions,
 					typedClientPath: typedClientBasePath,
 					outputPackage:   "fake",
 					imports:         generator.NewImportTracker(),
+					clientsetPath:   filepath.Join(customArgs.ClientsetOutputPath, customArgs.ClientsetName),
 				},
 			}
 			return generators

@@ -20,25 +20,30 @@ set -o pipefail
 
 KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
 
-: ${KUBE_VERSION_ROOT:=${KUBE_ROOT}}
-: ${KUBECTL:=${KUBE_VERSION_ROOT}/cluster/kubectl.sh}
+: ${KUBECTL:=${KUBE_ROOT}/cluster/kubectl.sh}
 : ${KUBE_CONFIG_FILE:="config-test.sh"}
 
 export KUBECTL KUBE_CONFIG_FILE
 
-source "${KUBE_ROOT}/cluster/kube-env.sh"
-source "${KUBE_VERSION_ROOT}/cluster/${KUBERNETES_PROVIDER}/util.sh"
+source "${KUBE_ROOT}/cluster/kube-util.sh"
 
 prepare-e2e
 
-if [[ ${MULTIZONE:-} == "true" ]]; then
-    for KUBE_GCE_ZONE in ${E2E_ZONES}
-    do
-	KUBE_GCE_ZONE="${KUBE_GCE_ZONE}" KUBE_USE_EXISTING_MASTER="${KUBE_USE_EXISTING_MASTER:-}" KUBE_TEST_DEBUG=y "${KUBE_VERSION_ROOT}/cluster/kube-up.sh"
-	KUBE_USE_EXISTING_MASTER="true" # For subsequent zones we use the existing master
+if [[ "${FEDERATION:-}" == "true" ]];then
+    #TODO(colhom): the last cluster that was created in the loop above is the current context.
+    # Hence, it will be the cluster that hosts the federated components.
+    # In the future, we will want to loop through the all the federated contexts,
+    # select each one and call federated-up
+    for zone in ${E2E_ZONES};do
+	(
+	    set-federation-zone-vars "$zone"
+	    test-setup
+	)
     done
+    if [[ -f "${KUBE_ROOT}/federation/manifests/federated-image.tag" ]];then
+	export FEDERATION_IMAGE_TAG="$(cat "${KUBE_ROOT}/federation/manifests/federated-image.tag")"
+    fi
+    "${KUBE_ROOT}/federation/cluster/federation-up.sh"
 else
-    KUBE_TEST_DEBUG=y "${KUBE_VERSION_ROOT}/cluster/kube-up.sh"
+    test-setup
 fi
-
-test-setup

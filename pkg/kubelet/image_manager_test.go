@@ -25,16 +25,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/kubernetes/pkg/client/record"
-	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
+	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/container"
+	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
 	"k8s.io/kubernetes/pkg/util"
 )
 
 var zero time.Time
 
-func newRealImageManager(policy ImageGCPolicy) (*realImageManager, *container.FakeRuntime, *cadvisor.Mock) {
-	fakeRuntime := &container.FakeRuntime{}
-	mockCadvisor := new(cadvisor.Mock)
+func newRealImageManager(policy ImageGCPolicy) (*realImageManager, *containertest.FakeRuntime, *cadvisortest.Mock) {
+	fakeRuntime := &containertest.FakeRuntime{}
+	mockCadvisor := new(cadvisortest.Mock)
 	return &realImageManager{
 		runtime:      fakeRuntime,
 		policy:       policy,
@@ -74,7 +75,7 @@ func makeImage(id int, size int64) container.Image {
 // Make a container with the specified ID. It will use the image with the same ID.
 func makeContainer(id int) *container.Container {
 	return &container.Container{
-		ID:    container.ContainerID{"test", fmt.Sprintf("container-%d", id)},
+		ID:    container.ContainerID{Type: "test", ID: fmt.Sprintf("container-%d", id)},
 		Image: imageName(id),
 	}
 }
@@ -322,7 +323,35 @@ func TestFreeSpaceImagesAlsoDoesLookupByRepoTags(t *testing.T) {
 		{
 			Containers: []*container.Container{
 				{
-					ID:    container.ContainerID{"test", "c5678"},
+					ID:    container.ContainerID{Type: "test", ID: "c5678"},
+					Image: "salad",
+				},
+			},
+		},
+	}
+
+	spaceFreed, err := manager.freeSpace(1024, time.Now())
+	assert := assert.New(t)
+	require.NoError(t, err)
+	assert.EqualValues(1024, spaceFreed)
+	assert.Len(fakeRuntime.ImageList, 1)
+}
+
+func TestFreeSpaceImagesAlsoDoesLookupByRepoDigests(t *testing.T) {
+	manager, fakeRuntime, _ := newRealImageManager(ImageGCPolicy{})
+	fakeRuntime.ImageList = []container.Image{
+		makeImage(0, 1024),
+		{
+			ID:          "5678",
+			RepoDigests: []string{"potato", "salad"},
+			Size:        2048,
+		},
+	}
+	fakeRuntime.AllPodList = []*container.Pod{
+		{
+			Containers: []*container.Container{
+				{
+					ID:    container.ContainerID{Type: "test", ID: "c5678"},
 					Image: "salad",
 				},
 			},
@@ -344,7 +373,7 @@ func TestGarbageCollectBelowLowThreshold(t *testing.T) {
 	manager, _, mockCadvisor := newRealImageManager(policy)
 
 	// Expect 40% usage.
-	mockCadvisor.On("DockerImagesFsInfo").Return(cadvisorapiv2.FsInfo{
+	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
 		Usage:    400,
 		Capacity: 1000,
 	}, nil)
@@ -359,7 +388,7 @@ func TestGarbageCollectCadvisorFailure(t *testing.T) {
 	}
 	manager, _, mockCadvisor := newRealImageManager(policy)
 
-	mockCadvisor.On("DockerImagesFsInfo").Return(cadvisorapiv2.FsInfo{}, fmt.Errorf("error"))
+	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{}, fmt.Errorf("error"))
 	assert.NotNil(t, manager.GarbageCollect())
 }
 
@@ -371,7 +400,7 @@ func TestGarbageCollectBelowSuccess(t *testing.T) {
 	manager, fakeRuntime, mockCadvisor := newRealImageManager(policy)
 
 	// Expect 95% usage and most of it gets freed.
-	mockCadvisor.On("DockerImagesFsInfo").Return(cadvisorapiv2.FsInfo{
+	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
 		Usage:    950,
 		Capacity: 1000,
 	}, nil)
@@ -390,7 +419,7 @@ func TestGarbageCollectNotEnoughFreed(t *testing.T) {
 	manager, fakeRuntime, mockCadvisor := newRealImageManager(policy)
 
 	// Expect 95% usage and little of it gets freed.
-	mockCadvisor.On("DockerImagesFsInfo").Return(cadvisorapiv2.FsInfo{
+	mockCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
 		Usage:    950,
 		Capacity: 1000,
 	}, nil)
@@ -407,8 +436,8 @@ func TestGarbageCollectImageNotOldEnough(t *testing.T) {
 		LowThresholdPercent:  80,
 		MinAge:               time.Minute * 1,
 	}
-	fakeRuntime := &container.FakeRuntime{}
-	mockCadvisor := new(cadvisor.Mock)
+	fakeRuntime := &containertest.FakeRuntime{}
+	mockCadvisor := new(cadvisortest.Mock)
 	manager := &realImageManager{
 		runtime:      fakeRuntime,
 		policy:       policy,

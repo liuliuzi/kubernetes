@@ -30,11 +30,12 @@ import (
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	kubectltesting "k8s.io/kubernetes/pkg/kubectl/testing"
 	"k8s.io/kubernetes/pkg/runtime"
 	yamlserializer "k8s.io/kubernetes/pkg/runtime/serializer/yaml"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/diff"
 	"k8s.io/kubernetes/pkg/util/intstr"
 	"k8s.io/kubernetes/pkg/util/sets"
 
@@ -104,7 +105,7 @@ func TestPrinter(t *testing.T) {
 		},
 	}
 	emptyListTest := &api.PodList{}
-	testapi, err := api.Scheme.ConvertToVersion(podTest, testapi.Default.GroupVersion().String())
+	testapi, err := api.Scheme.ConvertToVersion(podTest, *testapi.Default.GroupVersion())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -182,7 +183,7 @@ func testPrinter(t *testing.T, printer ResourcePrinter, unmarshalFunc func(data 
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(testData, poutput) {
-		t.Errorf("Test data and unmarshaled data are not equal: %v", util.ObjectDiff(poutput, testData))
+		t.Errorf("Test data and unmarshaled data are not equal: %v", diff.ObjectDiff(poutput, testData))
 	}
 
 	obj := &api.Pod{
@@ -202,7 +203,7 @@ func testPrinter(t *testing.T, printer ResourcePrinter, unmarshalFunc func(data 
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(obj, &objOut) {
-		t.Errorf("Unexpected inequality:\n%v", util.ObjectDiff(obj, &objOut))
+		t.Errorf("Unexpected inequality:\n%v", diff.ObjectDiff(obj, &objOut))
 	}
 }
 
@@ -299,10 +300,10 @@ func TestNamePrinter(t *testing.T) {
 				},
 				Items: []runtime.RawExtension{
 					{
-						RawJSON: []byte(`{"kind": "Pod", "apiVersion": "v1", "metadata": { "name": "foo"}}`),
+						Raw: []byte(`{"kind": "Pod", "apiVersion": "v1", "metadata": { "name": "foo"}}`),
 					},
 					{
-						RawJSON: []byte(`{"kind": "Pod", "apiVersion": "v1", "metadata": { "name": "bar"}}`),
+						Raw: []byte(`{"kind": "Pod", "apiVersion": "v1", "metadata": { "name": "bar"}}`),
 					},
 				},
 			},
@@ -465,7 +466,7 @@ func TestPrinters(t *testing.T) {
 		"template2":            templatePrinter2,
 		"jsonpath":             jsonpathPrinter,
 		"name": &NamePrinter{
-			Typer:   runtime.ObjectTyperToTyper(api.Scheme),
+			Typer:   api.Scheme,
 			Decoder: api.Codecs.UniversalDecoder(),
 		},
 	}
@@ -705,7 +706,7 @@ func TestPrintHumanReadableService(t *testing.T) {
 		},
 		{
 			Spec: api.ServiceSpec{
-				ClusterIP: "1.2.3.4",
+				ClusterIP: "1.3.4.5",
 				Ports: []api.ServicePort{
 					{
 						Port:     80,
@@ -724,7 +725,7 @@ func TestPrintHumanReadableService(t *testing.T) {
 		},
 		{
 			Spec: api.ServiceSpec{
-				ClusterIP: "1.2.3.4",
+				ClusterIP: "1.4.5.6",
 				Type:      "LoadBalancer",
 				Ports: []api.ServicePort{
 					{
@@ -753,7 +754,7 @@ func TestPrintHumanReadableService(t *testing.T) {
 		},
 		{
 			Spec: api.ServiceSpec{
-				ClusterIP: "1.2.3.4",
+				ClusterIP: "1.5.6.7",
 				Type:      "LoadBalancer",
 				Ports: []api.ServicePort{
 					{
@@ -790,30 +791,33 @@ func TestPrintHumanReadableService(t *testing.T) {
 	}
 
 	for _, svc := range tests {
-		buff := bytes.Buffer{}
-		printService(&svc, &buff, PrintOptions{false, false, false, false, false, false, []string{}})
-		output := string(buff.Bytes())
-		ip := svc.Spec.ClusterIP
-		if !strings.Contains(output, ip) {
-			t.Errorf("expected to contain ClusterIP %s, but doesn't: %s", ip, output)
-		}
-
-		for _, ingress := range svc.Status.LoadBalancer.Ingress {
-			ip = ingress.IP
+		for _, wide := range []bool{false, true} {
+			buff := bytes.Buffer{}
+			printService(&svc, &buff, PrintOptions{false, false, wide, false, false, false, []string{}})
+			output := string(buff.Bytes())
+			ip := svc.Spec.ClusterIP
 			if !strings.Contains(output, ip) {
-				t.Errorf("expected to contain ingress ip %s, but doesn't: %s", ip, output)
+				t.Errorf("expected to contain ClusterIP %s, but doesn't: %s", ip, output)
 			}
-		}
 
-		for _, port := range svc.Spec.Ports {
-			portSpec := fmt.Sprintf("%d/%s", port.Port, port.Protocol)
-			if !strings.Contains(output, portSpec) {
-				t.Errorf("expected to contain port: %s, but doesn't: %s", portSpec, output)
+			for n, ingress := range svc.Status.LoadBalancer.Ingress {
+				ip = ingress.IP
+				// For non-wide output, we only guarantee the first IP to be printed
+				if (n == 0 || wide) && !strings.Contains(output, ip) {
+					t.Errorf("expected to contain ingress ip %s with wide=%v, but doesn't: %s", ip, wide, output)
+				}
 			}
-		}
-		// Each service should print on one line
-		if 1 != strings.Count(output, "\n") {
-			t.Errorf("expected a single newline, found %d", strings.Count(output, "\n"))
+
+			for _, port := range svc.Spec.Ports {
+				portSpec := fmt.Sprintf("%d/%s", port.Port, port.Protocol)
+				if !strings.Contains(output, portSpec) {
+					t.Errorf("expected to contain port: %s, but doesn't: %s", portSpec, output)
+				}
+			}
+			// Each service should print on one line
+			if 1 != strings.Count(output, "\n") {
+				t.Errorf("expected a single newline, found %d", strings.Count(output, "\n"))
+			}
 		}
 	}
 }
@@ -1255,9 +1259,9 @@ func TestTranslateTimestamp(t *testing.T) {
 		{"30 seconds ago", translateTimestamp(unversioned.Time{Time: time.Now().Add(-3e10)}), "30s"},
 		{"5 minutes ago", translateTimestamp(unversioned.Time{Time: time.Now().Add(-3e11)}), "5m"},
 		{"an hour ago", translateTimestamp(unversioned.Time{Time: time.Now().Add(-6e12)}), "1h"},
-		{"2 days ago", translateTimestamp(unversioned.Time{Time: time.Now().AddDate(0, 0, -2)}), "2d"},
-		{"months ago", translateTimestamp(unversioned.Time{Time: time.Now().AddDate(0, 0, -90)}), "90d"},
-		{"10 years ago", translateTimestamp(unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)}), "10y"},
+		{"2 days ago", translateTimestamp(unversioned.Time{Time: time.Now().UTC().AddDate(0, 0, -2)}), "2d"},
+		{"months ago", translateTimestamp(unversioned.Time{Time: time.Now().UTC().AddDate(0, 0, -90)}), "90d"},
+		{"10 years ago", translateTimestamp(unversioned.Time{Time: time.Now().UTC().AddDate(-10, 0, 0)}), "10y"},
 	}
 	for _, test := range tl {
 		if test.got != test.exp {
@@ -1298,6 +1302,89 @@ func TestPrintDeployment(t *testing.T) {
 	buf := bytes.NewBuffer([]byte{})
 	for _, test := range tests {
 		printDeployment(&test.deployment, buf, PrintOptions{false, false, false, true, false, false, []string{}})
+		if buf.String() != test.expect {
+			t.Fatalf("Expected: %s, got: %s", test.expect, buf.String())
+		}
+		buf.Reset()
+	}
+}
+
+func TestPrintDaemonSet(t *testing.T) {
+	tests := []struct {
+		ds         extensions.DaemonSet
+		startsWith string
+	}{
+		{
+			extensions.DaemonSet{
+				ObjectMeta: api.ObjectMeta{
+					Name:              "test1",
+					CreationTimestamp: unversioned.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: extensions.DaemonSetSpec{
+					Template: api.PodTemplateSpec{
+						Spec: api.PodSpec{Containers: make([]api.Container, 2)},
+					},
+				},
+				Status: extensions.DaemonSetStatus{
+					CurrentNumberScheduled: 2,
+					DesiredNumberScheduled: 3,
+				},
+			},
+			"test1\t3\t2\t<none>\t0s\n",
+		},
+	}
+
+	buf := bytes.NewBuffer([]byte{})
+	for _, test := range tests {
+		printDaemonSet(&test.ds, buf, PrintOptions{false, false, false, false, false, false, []string{}})
+		if !strings.HasPrefix(buf.String(), test.startsWith) {
+			t.Fatalf("Expected to start with %s but got %s", test.startsWith, buf.String())
+		}
+		buf.Reset()
+	}
+}
+
+func TestPrintJob(t *testing.T) {
+	completions := int32(2)
+	tests := []struct {
+		job    batch.Job
+		expect string
+	}{
+		{
+			batch.Job{
+				ObjectMeta: api.ObjectMeta{
+					Name:              "job1",
+					CreationTimestamp: unversioned.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: batch.JobSpec{
+					Completions: &completions,
+				},
+				Status: batch.JobStatus{
+					Succeeded: 1,
+				},
+			},
+			"job1\t2\t1\t0s\n",
+		},
+		{
+			batch.Job{
+				ObjectMeta: api.ObjectMeta{
+					Name:              "job2",
+					CreationTimestamp: unversioned.Time{Time: time.Now().AddDate(-10, 0, 0)},
+				},
+				Spec: batch.JobSpec{
+					Completions: nil,
+				},
+				Status: batch.JobStatus{
+					Succeeded: 0,
+				},
+			},
+			"job2\t<none>\t0\t10y\n",
+		},
+	}
+
+	buf := bytes.NewBuffer([]byte{})
+	for _, test := range tests {
+		printJob(&test.job, buf, PrintOptions{false, false, false, true, false, false, []string{}})
 		if buf.String() != test.expect {
 			t.Fatalf("Expected: %s, got: %s", test.expect, buf.String())
 		}

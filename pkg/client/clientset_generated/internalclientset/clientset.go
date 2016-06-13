@@ -18,54 +18,111 @@ package internalclientset
 
 import (
 	"github.com/golang/glog"
-	unversionedcore "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
-	unversionedextensions "k8s.io/kubernetes/pkg/client/typed/generated/extensions/unversioned"
-	unversioned "k8s.io/kubernetes/pkg/client/unversioned"
+	unversionedautoscaling "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/autoscaling/unversioned"
+	unversionedbatch "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/batch/unversioned"
+	unversionedcore "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/core/unversioned"
+	unversionedextensions "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/extensions/unversioned"
+	unversionedrbac "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/typed/rbac/unversioned"
+	restclient "k8s.io/kubernetes/pkg/client/restclient"
+	discovery "k8s.io/kubernetes/pkg/client/typed/discovery"
+	"k8s.io/kubernetes/pkg/util/flowcontrol"
 )
 
 type Interface interface {
-	Discovery() unversioned.DiscoveryInterface
+	Discovery() discovery.DiscoveryInterface
 	Core() unversionedcore.CoreInterface
 	Extensions() unversionedextensions.ExtensionsInterface
+	Autoscaling() unversionedautoscaling.AutoscalingInterface
+	Batch() unversionedbatch.BatchInterface
+	Rbac() unversionedrbac.RbacInterface
 }
 
 // Clientset contains the clients for groups. Each group has exactly one
 // version included in a Clientset.
 type Clientset struct {
-	*unversioned.DiscoveryClient
+	*discovery.DiscoveryClient
 	*unversionedcore.CoreClient
 	*unversionedextensions.ExtensionsClient
+	*unversionedautoscaling.AutoscalingClient
+	*unversionedbatch.BatchClient
+	*unversionedrbac.RbacClient
 }
 
 // Core retrieves the CoreClient
 func (c *Clientset) Core() unversionedcore.CoreInterface {
+	if c == nil {
+		return nil
+	}
 	return c.CoreClient
 }
 
 // Extensions retrieves the ExtensionsClient
 func (c *Clientset) Extensions() unversionedextensions.ExtensionsInterface {
+	if c == nil {
+		return nil
+	}
 	return c.ExtensionsClient
 }
 
+// Autoscaling retrieves the AutoscalingClient
+func (c *Clientset) Autoscaling() unversionedautoscaling.AutoscalingInterface {
+	if c == nil {
+		return nil
+	}
+	return c.AutoscalingClient
+}
+
+// Batch retrieves the BatchClient
+func (c *Clientset) Batch() unversionedbatch.BatchInterface {
+	if c == nil {
+		return nil
+	}
+	return c.BatchClient
+}
+
+// Rbac retrieves the RbacClient
+func (c *Clientset) Rbac() unversionedrbac.RbacInterface {
+	if c == nil {
+		return nil
+	}
+	return c.RbacClient
+}
+
 // Discovery retrieves the DiscoveryClient
-func (c *Clientset) Discovery() unversioned.DiscoveryInterface {
+func (c *Clientset) Discovery() discovery.DiscoveryInterface {
 	return c.DiscoveryClient
 }
 
 // NewForConfig creates a new Clientset for the given config.
-func NewForConfig(c *unversioned.Config) (*Clientset, error) {
+func NewForConfig(c *restclient.Config) (*Clientset, error) {
+	configShallowCopy := *c
+	if configShallowCopy.RateLimiter == nil && configShallowCopy.QPS > 0 {
+		configShallowCopy.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(configShallowCopy.QPS, configShallowCopy.Burst)
+	}
 	var clientset Clientset
 	var err error
-	clientset.CoreClient, err = unversionedcore.NewForConfig(c)
+	clientset.CoreClient, err = unversionedcore.NewForConfig(&configShallowCopy)
 	if err != nil {
 		return &clientset, err
 	}
-	clientset.ExtensionsClient, err = unversionedextensions.NewForConfig(c)
+	clientset.ExtensionsClient, err = unversionedextensions.NewForConfig(&configShallowCopy)
+	if err != nil {
+		return &clientset, err
+	}
+	clientset.AutoscalingClient, err = unversionedautoscaling.NewForConfig(&configShallowCopy)
+	if err != nil {
+		return &clientset, err
+	}
+	clientset.BatchClient, err = unversionedbatch.NewForConfig(&configShallowCopy)
+	if err != nil {
+		return &clientset, err
+	}
+	clientset.RbacClient, err = unversionedrbac.NewForConfig(&configShallowCopy)
 	if err != nil {
 		return &clientset, err
 	}
 
-	clientset.DiscoveryClient, err = unversioned.NewDiscoveryClientForConfig(c)
+	clientset.DiscoveryClient, err = discovery.NewDiscoveryClientForConfig(&configShallowCopy)
 	if err != nil {
 		glog.Errorf("failed to create the DiscoveryClient: %v", err)
 	}
@@ -74,21 +131,27 @@ func NewForConfig(c *unversioned.Config) (*Clientset, error) {
 
 // NewForConfigOrDie creates a new Clientset for the given config and
 // panics if there is an error in the config.
-func NewForConfigOrDie(c *unversioned.Config) *Clientset {
+func NewForConfigOrDie(c *restclient.Config) *Clientset {
 	var clientset Clientset
 	clientset.CoreClient = unversionedcore.NewForConfigOrDie(c)
 	clientset.ExtensionsClient = unversionedextensions.NewForConfigOrDie(c)
+	clientset.AutoscalingClient = unversionedautoscaling.NewForConfigOrDie(c)
+	clientset.BatchClient = unversionedbatch.NewForConfigOrDie(c)
+	clientset.RbacClient = unversionedrbac.NewForConfigOrDie(c)
 
-	clientset.DiscoveryClient = unversioned.NewDiscoveryClientForConfigOrDie(c)
+	clientset.DiscoveryClient = discovery.NewDiscoveryClientForConfigOrDie(c)
 	return &clientset
 }
 
 // New creates a new Clientset for the given RESTClient.
-func New(c *unversioned.RESTClient) *Clientset {
+func New(c *restclient.RESTClient) *Clientset {
 	var clientset Clientset
 	clientset.CoreClient = unversionedcore.New(c)
 	clientset.ExtensionsClient = unversionedextensions.New(c)
+	clientset.AutoscalingClient = unversionedautoscaling.New(c)
+	clientset.BatchClient = unversionedbatch.New(c)
+	clientset.RbacClient = unversionedrbac.New(c)
 
-	clientset.DiscoveryClient = unversioned.NewDiscoveryClient(c)
+	clientset.DiscoveryClient = discovery.NewDiscoveryClient(c)
 	return &clientset
 }

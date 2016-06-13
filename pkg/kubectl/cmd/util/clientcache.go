@@ -17,17 +17,20 @@ limitations under the License.
 package util
 
 import (
+	fed_clientset "k8s.io/kubernetes/federation/client/clientset_generated/federation_internalclientset"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/kubernetes/pkg/client/restclient"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
 )
 
 func NewClientCache(loader clientcmd.ClientConfig) *ClientCache {
 	return &ClientCache{
-		clients: make(map[unversioned.GroupVersion]*client.Client),
-		configs: make(map[unversioned.GroupVersion]*client.Config),
-		loader:  loader,
+		clients:       make(map[unversioned.GroupVersion]*client.Client),
+		configs:       make(map[unversioned.GroupVersion]*restclient.Config),
+		fedClientSets: make(map[unversioned.GroupVersion]fed_clientset.Interface),
+		loader:        loader,
 	}
 }
 
@@ -36,14 +39,15 @@ func NewClientCache(loader clientcmd.ClientConfig) *ClientCache {
 type ClientCache struct {
 	loader        clientcmd.ClientConfig
 	clients       map[unversioned.GroupVersion]*client.Client
-	configs       map[unversioned.GroupVersion]*client.Config
-	defaultConfig *client.Config
+	fedClientSets map[unversioned.GroupVersion]fed_clientset.Interface
+	configs       map[unversioned.GroupVersion]*restclient.Config
+	defaultConfig *restclient.Config
 	defaultClient *client.Client
 	matchVersion  bool
 }
 
 // ClientConfigForVersion returns the correct config for a server
-func (c *ClientCache) ClientConfigForVersion(version *unversioned.GroupVersion) (*client.Config, error) {
+func (c *ClientCache) ClientConfigForVersion(version *unversioned.GroupVersion) (*restclient.Config, error) {
 	if c.defaultConfig == nil {
 		config, err := c.loader.ClientConfig()
 		if err != nil {
@@ -123,4 +127,42 @@ func (c *ClientCache) ClientForVersion(version *unversioned.GroupVersion) (*clie
 	}
 
 	return kubeclient, nil
+}
+
+func (c *ClientCache) FederationClientSetForVersion(version *unversioned.GroupVersion) (fed_clientset.Interface, error) {
+	if version != nil {
+		if clientSet, found := c.fedClientSets[*version]; found {
+			return clientSet, nil
+		}
+	}
+	config, err := c.ClientConfigForVersion(version)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: support multi versions of client with clientset
+	clientSet, err := fed_clientset.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	c.fedClientSets[*config.GroupVersion] = clientSet
+
+	if version != nil {
+		configCopy := *config
+		clientSet, err := fed_clientset.NewForConfig(&configCopy)
+		if err != nil {
+			return nil, err
+		}
+		c.fedClientSets[*version] = clientSet
+	}
+
+	return clientSet, nil
+}
+
+func (c *ClientCache) FederationClientForVersion(version *unversioned.GroupVersion) (*restclient.RESTClient, error) {
+	fedClientSet, err := c.FederationClientSetForVersion(version)
+	if err != nil {
+		return nil, err
+	}
+	return fedClientSet.(*fed_clientset.Clientset).FederationClient.RESTClient, nil
 }

@@ -28,7 +28,7 @@ import (
 
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 
-	"github.com/fsouza/go-dockerclient"
+	dockertypes "github.com/docker/engine-api/types"
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
 	bindings "github.com/mesos/mesos-go/executor"
@@ -46,12 +46,6 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/dockertools"
 	kruntime "k8s.io/kubernetes/pkg/runtime"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
-)
-
-const (
-	containerPollTime = 1 * time.Second
-	lostPodPollTime   = 1 * time.Minute
-	podRelistPeriod   = 5 * time.Minute
 )
 
 type stateType int32
@@ -156,8 +150,10 @@ func New(config Config) *Executor {
 		nodeInfos:         config.NodeInfos,
 		initCompleted:     make(chan struct{}),
 		registry:          config.Registry,
-		kubeAPI:           &clientAPIWrapper{config.APIClient},
-		nodeAPI:           &clientAPIWrapper{config.APIClient},
+	}
+	if config.APIClient != nil {
+		k.kubeAPI = &clientAPIWrapper{config.APIClient.Core()}
+		k.nodeAPI = &clientAPIWrapper{config.APIClient.Core()}
 	}
 
 	// apply functional options
@@ -494,7 +490,7 @@ func (k *Executor) bindAndWatchTask(driver bindings.ExecutorDriver, task *mesos.
 	// within the launch timeout window we should see a pod-task update via the registry.
 	// if we see a Running update then we need to generate a TASK_RUNNING status update for mesos.
 	handlerFinished := false
-	handler := watchHandler{
+	handler := &watchHandler{
 		expiration: watchExpiration{
 			timeout: launchTimer.C,
 			onEvent: func(taskID string) {
@@ -661,14 +657,13 @@ func (k *Executor) doShutdown(driver bindings.ExecutorDriver) {
 // Destroy existing k8s containers
 func (k *Executor) killKubeletContainers() {
 	if containers, err := dockertools.GetKubeletDockerContainers(k.dockerClient, true); err == nil {
-		opts := docker.RemoveContainerOptions{
+		opts := dockertypes.ContainerRemoveOptions{
 			RemoveVolumes: true,
 			Force:         true,
 		}
 		for _, container := range containers {
-			opts.ID = container.ID
-			log.V(2).Infof("Removing container: %v", opts.ID)
-			if err := k.dockerClient.RemoveContainer(opts); err != nil {
+			log.V(2).Infof("Removing container: %v", container.ID)
+			if err := k.dockerClient.RemoveContainer(container.ID, opts); err != nil {
 				log.Warning(err)
 			}
 		}

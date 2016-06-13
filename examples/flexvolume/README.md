@@ -18,6 +18,11 @@
 If you are using a released version of Kubernetes, you should
 refer to the docs that go with that version.
 
+<!-- TAG RELEASE_LINK, added by the munger automatically -->
+<strong>
+The latest release of this document can be found
+[here](http://releases.k8s.io/release-1.2/examples/flexvolume/README.md).
+
 Documentation for other releases can be found at
 [releases.k8s.io](http://releases.k8s.io).
 </strong>
@@ -43,26 +48,66 @@ For example to add a 'cifs' driver, by vendor 'foo' install the driver at: /usr/
 
 ## Plugin details
 
-Driver will be invoked with 'Init' to initalize the driver. It will be invoked with 'attach' to attach the volume and with 'detach' to detach the volume from the kubelet node. It also supports custom mounts using 'mount' and 'unmount' callouts to the driver.
+Driver will be invoked with 'Init' to initialize the driver. It will be invoked with 'attach' to attach the volume and with 'detach' to detach the volume from the kubelet node. It also supports custom mounts using 'mount' and 'unmount' callouts to the driver.
 
 ### Driver invocation model:
 
 Init:
-\<driver executable\> init
+
+```
+<driver executable> init
+```
 
 Attach:
-\<driver executable\> attach \<json options\>
+
+```
+<driver executable> attach <json options>
+```
 
 Detach:
-\<driver executable\> detach \<mount device\>
+
+```
+<driver executable> detach <mount device>
+```
 
 Mount:
-\<driver executable\> mount \<target mount dir\> \<mount device\> \<json options\>
+
+```
+<driver executable> mount <target mount dir> <mount device> <json options>
+```
 
 Unmount:
-\<driver executable\> unmount \<mount dir\>
+
+```
+<driver executable> unmount <mount dir>
+```
 
 See lvm[lvm] for a quick example on how to write a simple flexvolume driver.
+
+### Driver output:
+
+Flexvolume expects the driver to reply with the status of the operation in the
+following format.
+
+```
+{
+	"status": "<Success/Failure>",
+	"message": "<Reason for success/failure>",
+	"device": "<Path to the device attached. This field is valid only for attach calls>"
+}
+```
+
+### Default Json options
+
+In addition to the flags specified by the user in the Options field of the FlexVolumeSource, the following flags are also passed to the executable.
+
+```
+"kubernetes.io/fsType":"<FS type>",
+"kubernetes.io/readwrite":"<rw>",
+"kubernetes.io/secret/key1":"<secret1>"
+...
+"kubernetes.io/secret/keyN":"<secretN>"
+```
 
 ### Example of Flexvolume
 

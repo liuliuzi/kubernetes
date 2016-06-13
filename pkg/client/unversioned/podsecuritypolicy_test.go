@@ -24,13 +24,12 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/apis/extensions"
-	. "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/client/unversioned/testclient/simple"
 )
 
 func TestPodSecurityPolicyCreate(t *testing.T) {
 	ns := api.NamespaceNone
-	scc := &extensions.PodSecurityPolicy{
+	psp := &extensions.PodSecurityPolicy{
 		ObjectMeta: api.ObjectMeta{
 			Name: "abc",
 		},
@@ -41,18 +40,18 @@ func TestPodSecurityPolicyCreate(t *testing.T) {
 			Method: "POST",
 			Path:   testapi.Extensions.ResourcePath(getPSPResourcename(), ns, ""),
 			Query:  simple.BuildQueryValues(nil),
-			Body:   scc,
+			Body:   psp,
 		},
-		Response: simple.Response{StatusCode: 200, Body: scc},
+		Response: simple.Response{StatusCode: 200, Body: psp},
 	}
 
-	response, err := c.Setup(t).PodSecurityPolicies().Create(scc)
+	response, err := c.Setup(t).PodSecurityPolicies().Create(psp)
 	c.Validate(t, response, err)
 }
 
 func TestPodSecurityPolicyGet(t *testing.T) {
 	ns := api.NamespaceNone
-	scc := &extensions.PodSecurityPolicy{
+	psp := &extensions.PodSecurityPolicy{
 		ObjectMeta: api.ObjectMeta{
 			Name: "abc",
 		},
@@ -64,7 +63,7 @@ func TestPodSecurityPolicyGet(t *testing.T) {
 			Query:  simple.BuildQueryValues(nil),
 			Body:   nil,
 		},
-		Response: simple.Response{StatusCode: 200, Body: scc},
+		Response: simple.Response{StatusCode: 200, Body: psp},
 	}
 
 	response, err := c.Setup(t).PodSecurityPolicies().Get("abc")
@@ -73,7 +72,7 @@ func TestPodSecurityPolicyGet(t *testing.T) {
 
 func TestPodSecurityPolicyList(t *testing.T) {
 	ns := api.NamespaceNone
-	sccList := &extensions.PodSecurityPolicyList{
+	pspList := &extensions.PodSecurityPolicyList{
 		Items: []extensions.PodSecurityPolicy{
 			{
 				ObjectMeta: api.ObjectMeta{
@@ -89,7 +88,7 @@ func TestPodSecurityPolicyList(t *testing.T) {
 			Query:  simple.BuildQueryValues(nil),
 			Body:   nil,
 		},
-		Response: simple.Response{StatusCode: 200, Body: sccList},
+		Response: simple.Response{StatusCode: 200, Body: pspList},
 	}
 	response, err := c.Setup(t).PodSecurityPolicies().List(api.ListOptions{})
 	c.Validate(t, response, err)
@@ -97,7 +96,7 @@ func TestPodSecurityPolicyList(t *testing.T) {
 
 func TestPodSecurityPolicyUpdate(t *testing.T) {
 	ns := api.NamespaceNone
-	scc := &extensions.PodSecurityPolicy{
+	psp := &extensions.PodSecurityPolicy{
 		ObjectMeta: api.ObjectMeta{
 			Name:            "abc",
 			ResourceVersion: "1",
@@ -105,9 +104,9 @@ func TestPodSecurityPolicyUpdate(t *testing.T) {
 	}
 	c := &simple.Client{
 		Request:  simple.Request{Method: "PUT", Path: testapi.Extensions.ResourcePath(getPSPResourcename(), ns, "abc"), Query: simple.BuildQueryValues(nil)},
-		Response: simple.Response{StatusCode: 200, Body: scc},
+		Response: simple.Response{StatusCode: 200, Body: psp},
 	}
-	response, err := c.Setup(t).PodSecurityPolicies().Update(scc)
+	response, err := c.Setup(t).PodSecurityPolicies().Update(psp)
 	c.Validate(t, response, err)
 }
 

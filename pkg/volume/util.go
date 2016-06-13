@@ -28,31 +28,53 @@ import (
 	"k8s.io/kubernetes/pkg/watch"
 
 	"github.com/golang/glog"
+	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/api/resource"
 )
 
-// RecycleVolumeByWatchingPodUntilCompletion is intended for use with volume Recyclers.  This function will
-// save the given Pod to the API and watch it until it completes, fails, or the pod's ActiveDeadlineSeconds is exceeded, whichever comes first.
-// An attempt to delete a recycler pod is always attempted before returning.
-// 	pod - the pod designed by a volume plugin to recycle the volume
+// RecycleVolumeByWatchingPodUntilCompletion is intended for use with volume
+// Recyclers. This function will save the given Pod to the API and watch it
+// until it completes, fails, or the pod's ActiveDeadlineSeconds is exceeded,
+// whichever comes first. An attempt to delete a recycler pod is always
+// attempted before returning.
+//
+// In case there is a pod with the same namespace+name already running, this
+// function assumes it's an older instance of the recycler pod and watches
+// this old pod instead of starting a new one.
+//
+//  pod - the pod designed by a volume plugin to recycle the volume. pod.Name
+//        will be overwritten with unique name based on PV.Name.
 //	client - kube client for API operations.
-func RecycleVolumeByWatchingPodUntilCompletion(pod *api.Pod, kubeClient clientset.Interface) error {
-	return internalRecycleVolumeByWatchingPodUntilCompletion(pod, newRecyclerClient(kubeClient))
+func RecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *api.Pod, kubeClient clientset.Interface) error {
+	return internalRecycleVolumeByWatchingPodUntilCompletion(pvName, pod, newRecyclerClient(kubeClient))
 }
 
-// same as above func comments, except 'recyclerClient' is a narrower pod API interface to ease testing
-func internalRecycleVolumeByWatchingPodUntilCompletion(pod *api.Pod, recyclerClient recyclerClient) error {
-	glog.V(5).Infof("Creating recycler pod for volume %s\n", pod.Name)
-	pod, err := recyclerClient.CreatePod(pod)
-	if err != nil {
-		return fmt.Errorf("Unexpected error creating recycler pod:  %+v\n", err)
-	}
+// same as above func comments, except 'recyclerClient' is a narrower pod API
+// interface to ease testing
+func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *api.Pod, recyclerClient recyclerClient) error {
+	glog.V(5).Infof("creating recycler pod for volume %s\n", pod.Name)
 
+	// Generate unique name for the recycler pod - we need to get "already
+	// exists" error when a previous controller has already started recycling
+	// the volume. Here we assume that pv.Name is already unique.
+	pod.Name = "recycler-for-" + pvName
+	pod.GenerateName = ""
+
+	// Start the pod
+	_, err := recyclerClient.CreatePod(pod)
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			glog.V(5).Infof("old recycler pod %q found for volume", pod.Name)
+		} else {
+			return fmt.Errorf("Unexpected error creating recycler pod:  %+v\n", err)
+		}
+	}
 	defer recyclerClient.DeletePod(pod.Name, pod.Namespace)
 
+	// Now only the old pod or the new pod run. Watch it until it finishes.
 	stopChannel := make(chan struct{})
 	defer close(stopChannel)
-	nextPod := recyclerClient.WatchPod(pod.Name, pod.Namespace, pod.ResourceVersion, stopChannel)
+	nextPod := recyclerClient.WatchPod(pod.Name, pod.Namespace, stopChannel)
 
 	for {
 		watchedPod := nextPod()
@@ -65,19 +87,19 @@ func internalRecycleVolumeByWatchingPodUntilCompletion(pod *api.Pod, recyclerCli
 			if watchedPod.Status.Message != "" {
 				return fmt.Errorf(watchedPod.Status.Message)
 			} else {
-				return fmt.Errorf("Pod failed, pod.Status.Message unknown.")
+				return fmt.Errorf("pod failed, pod.Status.Message unknown.")
 			}
 		}
 	}
 }
 
 // recyclerClient abstracts access to a Pod by providing a narrower interface.
-// this makes it easier to mock a client for testing
+// This makes it easier to mock a client for testing.
 type recyclerClient interface {
 	CreatePod(pod *api.Pod) (*api.Pod, error)
 	GetPod(name, namespace string) (*api.Pod, error)
 	DeletePod(name, namespace string) error
-	WatchPod(name, namespace, resourceVersion string, stopChannel chan struct{}) func() *api.Pod
+	WatchPod(name, namespace string, stopChannel chan struct{}) func() *api.Pod
 }
 
 func newRecyclerClient(client clientset.Interface) recyclerClient {
@@ -101,9 +123,9 @@ func (c *realRecyclerClient) DeletePod(name, namespace string) error {
 }
 
 // WatchPod returns a ListWatch for watching a pod.  The stopChannel is used
-// to close the reflector backing the watch.  The caller is responsible for derring a close on the channel to
-// stop the reflector.
-func (c *realRecyclerClient) WatchPod(name, namespace, resourceVersion string, stopChannel chan struct{}) func() *api.Pod {
+// to close the reflector backing the watch.  The caller is responsible for
+// derring a close on the channel to stop the reflector.
+func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan struct{}) func() *api.Pod {
 	fieldSelector, _ := fields.ParseSelector("metadata.name=" + name)
 
 	podLW := &cache.ListWatch{
@@ -125,8 +147,10 @@ func (c *realRecyclerClient) WatchPod(name, namespace, resourceVersion string, s
 	}
 }
 
-// CalculateTimeoutForVolume calculates time for a Recycler pod to complete a recycle operation.
-// The calculation and return value is either the minimumTimeout or the timeoutIncrement per Gi of storage size, whichever is greater.
+// CalculateTimeoutForVolume calculates time for a Recycler pod to complete a
+// recycle operation. The calculation and return value is either the
+// minimumTimeout or the timeoutIncrement per Gi of storage size, whichever is
+// greater.
 func CalculateTimeoutForVolume(minimumTimeout, timeoutIncrement int, pv *api.PersistentVolume) int64 {
 	giQty := resource.MustParse("1Gi")
 	pvQty := pv.Spec.Capacity[api.ResourceStorage]
@@ -140,7 +164,7 @@ func CalculateTimeoutForVolume(minimumTimeout, timeoutIncrement int, pv *api.Per
 	}
 }
 
-// RoundUpSize calculates how many allocation units are needed to accomodate
+// RoundUpSize calculates how many allocation units are needed to accommodate
 // a volume of given size. E.g. when user wants 1500MiB volume, while AWS EBS
 // allocates volumes in gibibyte-sized chunks,
 // RoundUpSize(1500 * 1024*1024, 1024*1024*1024) returns '2'
@@ -149,11 +173,10 @@ func RoundUpSize(volumeSizeBytes int64, allocationUnitBytes int64) int64 {
 	return (volumeSizeBytes + allocationUnitBytes - 1) / allocationUnitBytes
 }
 
-// GenerateVolumeName returns a PV name with clusterName prefix.
-// The function should be used to generate a name of GCE PD or Cinder volume.
-// It basically adds "<clusterName>-dynamic-" before the PV name,
-// making sure the resulting string fits given length and cuts "dynamic"
-// if not.
+// GenerateVolumeName returns a PV name with clusterName prefix. The function
+// should be used to generate a name of GCE PD or Cinder volume. It basically
+// adds "<clusterName>-dynamic-" before the PV name, making sure the resulting
+// string fits given length and cuts "dynamic" if not.
 func GenerateVolumeName(clusterName, pvName string, maxLength int) string {
 	prefix := clusterName + "-dynamic"
 	pvLen := len(pvName)

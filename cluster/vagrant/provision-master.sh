@@ -21,6 +21,8 @@ set -o pipefail
 # Set the host name explicitly
 # See: https://github.com/mitchellh/vagrant/issues/2430
 hostnamectl set-hostname ${MASTER_NAME}
+# Set the variable to empty value explicitly
+if_to_edit=""
 
 if [[ "$(grep 'VERSION_ID' /etc/os-release)" =~ ^VERSION_ID=23 ]]; then
   # Disable network interface being managed by Network Manager (needed for Fedora 21+)
@@ -33,7 +35,13 @@ if [[ "$(grep 'VERSION_ID' /etc/os-release)" =~ ^VERSION_ID=23 ]]; then
   systemctl restart network
 fi
 
+# needed for vsphere support
+# handle the case when no 'VAGRANT-BEGIN' comment was defined in network-scripts
+# set the NETWORK_IF_NAME to have a default value in such case
 NETWORK_IF_NAME=`echo ${if_to_edit} | awk -F- '{ print $3 }'`
+if [[ -z "$NETWORK_IF_NAME" ]]; then
+  NETWORK_IF_NAME=${DEFAULT_NETWORK_IF_NAME}
+fi
 
 function release_not_found() {
   echo "It looks as if you don't have a compiled version of Kubernetes.  If you" >&2
@@ -56,6 +64,7 @@ done
 echo "127.0.0.1 localhost" >> /etc/hosts # enables cmds like 'kubectl get pods' on master.
 echo "$MASTER_IP $MASTER_NAME" >> /etc/hosts
 
+enable-accounting
 prepare-package-manager
 
 # Configure the master network
@@ -75,7 +84,8 @@ if [[ ! -f "${known_tokens_file}" ]]; then
   known_tokens_file="/srv/salt-overlay/salt/kube-apiserver/known_tokens.csv"
   (umask u=rw,go= ;
    echo "$KUBELET_TOKEN,kubelet,kubelet" > $known_tokens_file;
-   echo "$KUBE_PROXY_TOKEN,kube_proxy,kube_proxy" >> $known_tokens_file)
+   echo "$KUBE_PROXY_TOKEN,kube_proxy,kube_proxy" >> $known_tokens_file;
+   echo "$KUBE_BEARER_TOKEN,admin,admin" >> $known_tokens_file)
 
   mkdir -p /srv/salt-overlay/salt/kubelet
   kubelet_auth_file="/srv/salt-overlay/salt/kubelet/kubernetes_auth"
@@ -100,7 +110,7 @@ readonly BASIC_AUTH_FILE="/srv/salt-overlay/salt/kube-apiserver/basic_auth.csv"
 if [ ! -e "${BASIC_AUTH_FILE}" ]; then
   mkdir -p /srv/salt-overlay/salt/kube-apiserver
   (umask 077;
-    echo "${MASTER_USER},${MASTER_PASSWD},admin" > "${BASIC_AUTH_FILE}")
+    echo "${MASTER_PASSWD},${MASTER_USER},admin" > "${BASIC_AUTH_FILE}")
 fi
 
 # Enable Fedora Cockpit on host to support Kubernetes administration
@@ -109,7 +119,7 @@ if ! which /usr/libexec/cockpit-ws &>/dev/null; then
 
   pushd /etc/yum.repos.d
     curl -OL https://copr.fedorainfracloud.org/coprs/g/cockpit/cockpit-preview/repo/fedora-23/msuchy-cockpit-preview-fedora-23.repo
-    dnf install -y cockpit cockpit-kubernetes
+    dnf install -y cockpit cockpit-kubernetes docker socat ethtool
   popd
 
   systemctl enable cockpit.socket

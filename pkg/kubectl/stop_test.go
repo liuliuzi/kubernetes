@@ -25,6 +25,7 @@ import (
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/unversioned"
+	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/client/unversioned/testclient"
@@ -378,7 +379,7 @@ func TestReplicaSetStop(t *testing.T) {
 func TestJobStop(t *testing.T) {
 	name := "foo"
 	ns := "default"
-	zero := 0
+	zero := int32(0)
 	tests := []struct {
 		Name            string
 		Objs            []runtime.Object
@@ -388,26 +389,26 @@ func TestJobStop(t *testing.T) {
 		{
 			Name: "OnlyOneJob",
 			Objs: []runtime.Object{
-				&extensions.Job{ // GET
+				&batch.Job{ // GET
 					ObjectMeta: api.ObjectMeta{
 						Name:      name,
 						Namespace: ns,
 					},
-					Spec: extensions.JobSpec{
+					Spec: batch.JobSpec{
 						Parallelism: &zero,
 						Selector: &unversioned.LabelSelector{
 							MatchLabels: map[string]string{"k1": "v1"},
 						},
 					},
 				},
-				&extensions.JobList{ // LIST
-					Items: []extensions.Job{
+				&batch.JobList{ // LIST
+					Items: []batch.Job{
 						{
 							ObjectMeta: api.ObjectMeta{
 								Name:      name,
 								Namespace: ns,
 							},
-							Spec: extensions.JobSpec{
+							Spec: batch.JobSpec{
 								Parallelism: &zero,
 								Selector: &unversioned.LabelSelector{
 									MatchLabels: map[string]string{"k1": "v1"},
@@ -424,26 +425,26 @@ func TestJobStop(t *testing.T) {
 		{
 			Name: "JobWithDeadPods",
 			Objs: []runtime.Object{
-				&extensions.Job{ // GET
+				&batch.Job{ // GET
 					ObjectMeta: api.ObjectMeta{
 						Name:      name,
 						Namespace: ns,
 					},
-					Spec: extensions.JobSpec{
+					Spec: batch.JobSpec{
 						Parallelism: &zero,
 						Selector: &unversioned.LabelSelector{
 							MatchLabels: map[string]string{"k1": "v1"},
 						},
 					},
 				},
-				&extensions.JobList{ // LIST
-					Items: []extensions.Job{
+				&batch.JobList{ // LIST
+					Items: []batch.Job{
 						{
 							ObjectMeta: api.ObjectMeta{
 								Name:      name,
 								Namespace: ns,
 							},
-							Spec: extensions.JobSpec{
+							Spec: batch.JobSpec{
 								Parallelism: &zero,
 								Selector: &unversioned.LabelSelector{
 									MatchLabels: map[string]string{"k1": "v1"},
@@ -512,7 +513,7 @@ func TestDeploymentStop(t *testing.T) {
 			Replicas: 0,
 		},
 	}
-	template := deploymentutil.GetNewReplicaSetTemplate(deployment)
+	template := deploymentutil.GetNewReplicaSetTemplate(&deployment)
 	tests := []struct {
 		Name            string
 		Objs            []runtime.Object
@@ -538,8 +539,7 @@ func TestDeploymentStop(t *testing.T) {
 			},
 			StopError: nil,
 			ExpectedActions: []string{"get:deployments", "update:deployments",
-				"get:deployments", "get:deployments", "update:deployments",
-				"list:replicasets", "delete:deployments"},
+				"get:deployments", "list:replicasets", "delete:deployments"},
 		},
 		{
 			Name: "Deployment with single replicaset",
@@ -553,7 +553,7 @@ func TestDeploymentStop(t *testing.T) {
 								Namespace: ns,
 							},
 							Spec: extensions.ReplicaSetSpec{
-								Template: &template,
+								Template: template,
 							},
 						},
 					},
@@ -561,10 +561,9 @@ func TestDeploymentStop(t *testing.T) {
 			},
 			StopError: nil,
 			ExpectedActions: []string{"get:deployments", "update:deployments",
-				"get:deployments", "get:deployments", "update:deployments",
-				"list:replicasets", "get:replicasets", "get:replicasets",
-				"update:replicasets", "get:replicasets", "get:replicasets",
-				"delete:replicasets", "delete:deployments"},
+				"get:deployments", "list:replicasets", "get:replicasets",
+				"get:replicasets", "update:replicasets", "get:replicasets",
+				"get:replicasets", "delete:replicasets", "delete:deployments"},
 		},
 	}
 
@@ -706,7 +705,7 @@ func TestSimpleStop(t *testing.T) {
 		}
 		actions := fake.Actions()
 		if len(test.actions) != len(actions) {
-			t.Errorf("unexpected actions: %v; expected %v (%s)", fake.Actions, test.actions, test.test)
+			t.Errorf("unexpected actions: %v; expected %v (%s)", actions, test.actions, test.test)
 		}
 		for i, action := range actions {
 			testAction := test.actions[i]
